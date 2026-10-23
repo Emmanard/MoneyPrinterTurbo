@@ -1,0 +1,753 @@
+"""Captions, text cards, several visuals per scene, transitions, pauses, music and the
+other new looks. Real FFmpeg; narration comes from pre-made tone files so no network
+or TTS is needed. Thresholds on picture and level comparisons may need tuning once
+run against the container's ffmpeg."""
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from app.services import scene_pipeline as sp
+from app.services import scene_post
+
+SETTINGS = {"width": 270, "height": 480, "fps": 10}
+SAY = "Hello there my friends, welcome back to the show"
+
+
+def _ff(arguments):
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", *arguments],
+        check=True,
+    )
+
+
+def _probe(path, entry, select=None):
+    command = ["ffprobe", "-v", "error"]
+    if select:
+        command += ["-select_streams", select]
+    command += ["-show_entries", entry, "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    return float(subprocess.check_output(command, text=True).split()[0])
+
+
+def _duration(path):
+    return _probe(path, "format=duration")
+
+
+def _stream_duration(path, select):
+    return _probe(path, "stream=duration", select)
+
+
+def _png(path, pattern="testsrc", size="270x480"):
+    _ff(["-f", "lavfi", "-i", f"{pattern}=s={size}:d=1", "-frames:v", "1", str(path)])
+
+
+def _tone(path, seconds, frequency=440, gain=1):
+    _ff(["-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000:duration={seconds}",
+         "-af", f"volume={gain}", "-f", "wav", str(path)])
+
+
+def _frame(video, seconds, dest):
+    _ff(["-ss", str(seconds), "-i", str(video), "-frames:v", "1", str(dest)])
+    return dest
+
+
+def _psnr(first, second):
+    done = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(first), "-i", str(second),
+                           "-lavfi", "psnr", "-f", "null", "-"], capture_output=True, text=True)
+    return float(re.search(r"average:(\S+)", done.stderr).group(1))
+
+
+def _level(path, start, length):
+    done = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-ss", str(start), "-t", str(length), "-i", str(path),
+         "-af", "highpass=f=1000,volumedetect", "-f", "null", "-"], capture_output=True, text=True)
+    return float(re.search(r"mean_volume: (-?[\d.]+) dB", done.stderr).group(1))
+
+
+def _forbidden(*_args):
+    raise AssertionError("narration synthesis must not run")
+
+
+@pytest.fixture
+def project(tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("native FFmpeg/FFprobe required")
+    root = tmp_path / "project's files"
+    (root / "assets").mkdir(parents=True)
+    (root / "audio").mkdir()
+    _png(root / "assets" / "a.png")
+    _png(root / "assets" / "b.png", "smptebars")
+    _png(root / "assets" / "wide.png", "testsrc", "320x160")
+    _ff(["-f", "lavfi", "-i", "color=c=blue:s=270x480:r=10:d=2", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", str(root / "assets" / "clip.mp4")])
+    _tone(root / "audio" / "one.wav", 1.37, 440)
+    _tone(root / "audio" / "two.wav", 0.93, 330)
+    _tone(root / "audio" / "three.wav", 1.3, 550)
+    _tone(root / "audio" / "voice200.wav", 1.3, 200)
+    _tone(root / "audio" / "music_short.wav", 0.7, 1500, 4)
+    _tone(root / "audio" / "music_long.wav", 8, 1500, 4)
+    return root
+
+
+def _write(root, scenes, **extra):
+    manifest = {"schema_version": 1, "project_id": "ep", "settings": dict(SETTINGS), "scenes": scenes}
+    manifest.update(extra)
+    (root / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _scene(scene_id, audio="one.wav", asset="a.png", **extra):
+    return {"id": scene_id, "asset": asset, "audio": audio, "narration": SAY, **extra}
+
+
+def _build(root):
+    return sp.build(root, synthesize=_forbidden, progress=lambda _m: None)
+
+
+def _errors(root):
+    with pytest.raises(sp.ManifestError) as caught:
+        sp.load_manifest(root)
+    return str(caught.value)
+
+
+def _rebuilt(result):
+    return {key for key, reused in result["post_stages"].items() if not reused}
+
+
+# -- the original path is untouched ---------------------------------------
+
+def test_original_manifest_does_not_use_post_stages(project):
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", "b.png")])
+    manifest = sp.load_manifest(project)
+    assert sp.uses_post(manifest) is False
+    result = _build(project)
+    assert "post_stages" not in result and "stages" in result
+    assert not (project / ".scene_cache" / "post").exists()
+
+
+def test_original_filter_strings_are_unchanged():
+    assert sp.build_zoom_filter(270, 480, 10, 23, "zoom_in", "zoompan", 2) == (
+        "scale=540:960:force_original_aspect_ratio=increase:flags=lanczos,crop=540:960,"
+        "zoompan=z='1+0.069000*on/23':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=23:s=270x480:fps=10,"
+        "setsar=1,format=yuv420p"
+    )
+    # scale_crop zoom_in changed on purpose: its crop is now centred from the known
+    # sizes (the old '(iw-ow)/2' stuck to the top-left corner). zoompan is untouched.
+    assert sp.build_zoom_filter(270, 480, 10, 23, "zoom_in", "scale_crop", 2) == (
+        "scale=540:960:force_original_aspect_ratio=increase:flags=lanczos,crop=540:960,"
+        "scale=w='iw*(1+0.069000*t/2.300000)':h='ih*(1+0.069000*t/2.300000)':eval=frame:flags=bicubic,"
+        "crop=540:960:'540*(0.069000*t/2.300000)/2':'960*(0.069000*t/2.300000)/2',"
+        "scale=270:480:flags=lanczos,setsar=1,format=yuv420p"
+    )
+    assert sp.build_zoom_filter(270, 480, 10, 23, "static", "zoompan", 2) == (
+        "scale=270:480:force_original_aspect_ratio=increase:flags=lanczos,crop=270:480,"
+        "setsar=1,format=yuv420p"
+    )
+
+
+@pytest.mark.parametrize("extra,scene_extra", [
+    ({"bgm": {"file": "music_short.wav"}}, {}),
+    ({}, {"pause_after": 0.5}),
+    ({}, {"transition": {"type": "crossfade"}}),
+    ({}, {"text_cards": [{"text": "Hi", "start": 0, "end": 1}]}),
+    ({}, {"captions": {"enabled": True}}),
+    ({"settings": {**SETTINGS, "captions": {"enabled": True}}}, {}),
+])
+def test_each_new_feature_switches_on_the_post_stages(project, extra, scene_extra):
+    _write(project, [_scene("s1", **scene_extra), _scene("s2", "two.wav")], **extra)
+    assert sp.uses_post(sp.load_manifest(project)) is True
+
+
+def test_cut_transition_alone_does_not_need_post_stages(project):
+    _write(project, [_scene("s1", transition={"type": "cut"}), _scene("s2", "two.wav")])
+    assert sp.uses_post(sp.load_manifest(project)) is False
+
+
+# -- validation -----------------------------------------------------------
+
+def test_default_caption_style_in_settings_and_scene_override(project):
+    defaults = {"enabled": True, "mode": "words", "style": {"size": 40, "position": "top"}}
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", captions={"style": {"size": 60}}),
+                     _scene("s3", "three.wav", captions={"enabled": False})],
+           settings={**SETTINGS, "captions": defaults})
+    manifest = sp.load_manifest(project)
+    from app.services import scene_text
+    effective = [scene_text.merge_caption(manifest.captions, s.captions) for s in manifest.scenes]
+    assert [e["enabled"] for e in effective] == [True, True, False]
+    assert effective[1]["style"] == {"size": 60, "position": "top"}
+
+
+def test_captions_without_narration_are_rejected(project):
+    scene = {"id": "s1", "asset": "a.png", "audio": "one.wav", "captions": {"enabled": True}}
+    _write(project, [scene])
+    assert "captions need narration" in _errors(project)
+
+
+def test_new_scene_fields_are_validated_together(project):
+    _write(project, [
+        _scene("s1", pause_after=99, captions={"mode": "karaoke"},
+               text_cards=[{"text": "x", "start": 2, "end": 1}],
+               transition={"type": "spin", "duration": 9}),
+        _scene("s2", transition={"type": "crossfade"}),
+    ], bgm={"file": "missing.wav", "volume": 5, "ducking": {"amount": 40, "oops": 1}})
+    message = _errors(project)
+    for fragment in ("pause_after", "captions.mode", "text_cards[0].end", "transition.type",
+                     "last scene", "bgm.file", "bgm.volume", "ducking.amount", "ducking: unknown field"):
+        assert fragment in message
+
+
+def test_transition_duration_range_and_last_scene(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 9}), _scene("s2", "two.wav")])
+    assert "transition.duration" in _errors(project)
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", transition={"type": "dissolve"})])
+    assert "last scene" in _errors(project)
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", transition={"type": "cut"})])
+    assert sp.load_manifest(project).scenes[1].transition.type == "cut"
+
+
+def test_asset_and_assets_are_mutually_exclusive(project):
+    _write(project, [_scene("s1", assets=[{"file": "a.png"}])])
+    assert "either asset or assets" in _errors(project)
+    scene = {"id": "s1", "narration": SAY, "audio": "one.wav"}
+    _write(project, [scene])
+    assert "asset" in _errors(project)
+
+
+def test_assets_entries_are_validated(project):
+    scene = {"id": "s1", "narration": SAY, "audio": "one.wav", "assets": [
+        {"file": "a.png", "start": 2}, {"file": "gone.png"}, {"file": "b.png", "duration": -1, "x": 1},
+        {"file": "b.png", "motion": "spin"}]}
+    _write(project, [scene])
+    message = _errors(project)
+    for fragment in ("only applies to video", "gone.png", "duration", "unknown field: x", "motion"):
+        assert fragment in message
+
+
+def test_full_narration_audio_is_still_reserved(project):
+    _write(project, [_scene("s1")], full_narration_audio="all.mp3")
+    assert "reserved for a later phase" in _errors(project)
+
+
+def test_settings_bgm_volume_points_to_bgm(project):
+    _write(project, [_scene("s1")], settings={**SETTINGS, "bgm_volume": 0.2})
+    assert "bgm.volume" in _errors(project)
+
+
+def test_ducking_defaults_and_none(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_short.wav", "ducking": {}})
+    ducking = sp.load_manifest(project).bgm.ducking
+    assert (ducking.amount, ducking.attack, ducking.release) == (12.0, 150.0, 800.0)
+    _write(project, [_scene("s1")], bgm={"file": "music_short.wav"})
+    assert sp.load_manifest(project).bgm.ducking is None
+
+
+# -- captions and text cards in the picture -------------------------------
+
+def test_captions_are_burned_into_the_picture(project):
+    _write(project, [_scene("s1")])
+    plain = _frame(_build(project)["output"], 0.6, project / "plain.png")
+    _write(project, [_scene("s1")], settings={**SETTINGS, "captions": {"enabled": True, "mode": "words"}})
+    result = _build(project)
+    captioned = _frame(result["output"], 0.6, project / "captioned.png")
+    assert _psnr(plain, captioned) < 35
+    assert abs(_duration(result["output"]) - result["seconds"]) < 0.15
+
+
+def test_text_card_shows_only_between_start_and_end(project):
+    _write(project, [_scene("s1")])
+    plain = project / "plain.mp4"
+    shutil.copyfile(_build(project)["output"], plain)
+    _write(project, [_scene("s1", text_cards=[{"text": "A quote", "start": 0.4, "end": 0.9}])])
+    carded = _build(project)["output"]
+    before = _psnr(_frame(plain, 0.2, project / "p1.png"), _frame(carded, 0.2, project / "c1.png"))
+    during = _psnr(_frame(plain, 0.65, project / "p2.png"), _frame(carded, 0.65, project / "c2.png"))
+    after = _psnr(_frame(plain, 1.2, project / "p3.png"), _frame(carded, 1.2, project / "c3.png"))
+    assert during < 32
+    assert before > 36 and after > 36
+
+
+def test_text_card_past_the_end_of_the_scene_fails_before_rendering(project):
+    _write(project, [_scene("s1", text_cards=[{"text": "Late", "start": 0, "end": 30}])])
+    with pytest.raises(sp.PipelineError, match="text_cards"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_captions_follow_the_pause_after_rule(project):
+    _write(project, [_scene("s1", pause_after=1.0, captions={"enabled": True, "mode": "words"})])
+    result = _build(project)
+    assert result["frames"] == round((1.37 + 1.0) * 10)
+    during_pause = _frame(result["output"], 2.0, project / "pause.png")
+    plain = project / "plain_pause.png"
+    _write(project, [_scene("s1", pause_after=1.0)])
+    _frame(_build(project)["output"], 2.0, plain)
+    assert _psnr(plain, during_pause) > 36
+
+
+def test_changing_one_caption_rebuilds_only_that_scene(project):
+    scenes = [_scene("s1", captions={"enabled": True}), _scene("s2", "two.wav", captions={"enabled": True}),
+              _scene("s3", "three.wav", captions={"enabled": True})]
+    _write(project, scenes)
+    first = _build(project)
+    assert not any(first["post_stages"].values())
+    again = _build(project)
+    assert all(again["post_stages"].values()) and all(again["stages"].values())
+    scenes[1] = _scene("s2", "two.wav", captions={"enabled": True, "style": {"color": "#FFFF00"}})
+    _write(project, scenes)
+    changed = _build(project)
+    assert _rebuilt(changed) == {"s2:picture", "join:picture", "final"}
+    assert all(changed["stages"].values())
+
+
+# -- several visuals in one scene -----------------------------------------
+
+def test_asset_durations_that_add_up():
+    refs = (sp.AssetRef("a.png", duration=0.5), sp.AssetRef("b.png", duration=0.8))
+    assert sp.plan_asset_durations(refs, 1.3) == [0.5, 0.8]
+
+
+def test_small_mismatch_is_absorbed_by_the_last_asset():
+    refs = (sp.AssetRef("a.png", duration=0.5), sp.AssetRef("b.png", duration=0.7))
+    seconds = sp.plan_asset_durations(refs, 1.3)
+    assert seconds[0] == 0.5 and abs(seconds[1] - 0.8) < 1e-9
+
+
+def test_large_mismatch_is_rejected():
+    refs = (sp.AssetRef("a.png", duration=0.5), sp.AssetRef("b.png", duration=0.5))
+    with pytest.raises(sp.PipelineError, match="add up"):
+        sp.plan_asset_durations(refs, 1.3)
+
+
+def test_assets_without_a_duration_share_the_rest():
+    refs = (sp.AssetRef("a.png"), sp.AssetRef("b.png", duration=0.3), sp.AssetRef("c.png"))
+    seconds = sp.plan_asset_durations(refs, 1.3)
+    assert abs(seconds[0] - 0.5) < 1e-9 and abs(seconds[2] - 0.5) < 1e-9 and seconds[1] == 0.3
+
+
+def test_no_time_left_for_open_assets_is_rejected():
+    refs = (sp.AssetRef("a.png", duration=1.3), sp.AssetRef("b.png"))
+    with pytest.raises(sp.PipelineError, match="leaving"):
+        sp.plan_asset_durations(refs, 1.3)
+
+
+@pytest.mark.parametrize("seconds,total", [([0.5, 0.8], 14), ([0.33, 0.33, 0.64], 13), ([1.3], 16)])
+def test_frame_allocation_adds_up(seconds, total):
+    frames = sp.allocate_frames(seconds, total, 10)
+    assert sum(frames) == total and all(count >= 1 for count in frames)
+
+
+def test_multi_asset_scene_adds_up_to_the_audio(project):
+    assets = [{"file": "a.png", "duration": 0.5}, {"file": "clip.mp4"}, {"file": "b.png", "duration": 0.3}]
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav", "assets": assets}
+    _write(project, [scene])
+    manifest = sp.load_manifest(project)
+    infos = sp.inspect_media(manifest, project)
+    footage, rendered = sp.ensure_scene_visual(project, manifest, manifest.scenes[0], infos, 1.3)
+    assert rendered == 4 and 1.3 <= _duration(footage) <= 1.3 + 0.5
+    result = _build(project)
+    assert abs(_duration(result["output"]) - 1.3) < 0.25
+
+
+def test_mismatched_assets_fail_before_rendering(project):
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav",
+             "assets": [{"file": "a.png", "duration": 2}, {"file": "b.png", "duration": 2}]}
+    _write(project, [scene])
+    with pytest.raises(sp.PipelineError, match="add up"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_video_start_beyond_its_length_is_rejected(project):
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav",
+             "assets": [{"file": "clip.mp4", "start": 5}, {"file": "a.png"}]}
+    _write(project, [scene])
+    with pytest.raises(sp.ManifestError, match="start"):
+        sp.inspect_media(sp.load_manifest(project), project)
+
+
+def test_a_video_with_a_start_does_not_loop(project):
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav",
+             "assets": [{"file": "clip.mp4", "start": 1.5, "duration": 1.3}]}
+    _write(project, [scene])
+    with pytest.raises(sp.PipelineError, match="only loops"):
+        _build(project)
+
+
+def test_plan_reports_multi_asset_scenes(project, capsys):
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav", "assets": [{"file": "a.png"}, {"file": "b.png"}]}
+    _write(project, [scene])
+    assert sp.main(["--project", str(project), "plan"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["visual"] == "multi"
+
+
+# -- looks ----------------------------------------------------------------
+
+@pytest.mark.parametrize("engine", ["zoompan", "scale_crop"])
+@pytest.mark.parametrize("motion", ["zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"])
+def test_new_motions_move_the_picture(project, tmp_path, engine, motion):
+    image = project / "assets" / "a.png"
+    moving, still = tmp_path / "moving.mp4", tmp_path / "still.mp4"
+    sp.render_image_clip(image, moving, duration=2, width=270, height=480, fps=10, motion=motion, engine=engine)
+    sp.render_image_clip(image, still, duration=2, width=270, height=480, fps=10, motion="static")
+
+    def ends(clip, name):
+        first = _frame(clip, 0, tmp_path / f"{name}_first.png")
+        _ff(["-sseof", "-0.15", "-i", str(clip), "-update", "1", "-frames:v", "1", str(tmp_path / f"{name}_last.png")])
+        return _psnr(first, tmp_path / f"{name}_last.png")
+
+    assert ends(still, "still") > ends(moving, "moving") + 3
+
+
+def _fit_zoom(first_png, last_png):
+    """Scale and focal point (as fractions of the frame) that best map the first
+    frame onto the last. A coarse search on small grayscale copies."""
+    import numpy as np
+
+    size = (135, 240)
+    with Image.open(first_png) as a, Image.open(last_png) as b:
+        first = a.convert("L").resize(size, Image.BILINEAR)
+        target = np.asarray(b.convert("L").resize(size, Image.BILINEAR), dtype=np.float32)
+    best = None
+    for scale in np.arange(1.0, 1.26, 0.01):
+        inverse = 1.0 / scale
+        for fx in np.arange(0.0, 1.01, 0.1):
+            for fy in np.arange(0.0, 1.01, 0.1):
+                data = (inverse, 0, fx * size[0] * (1 - inverse), 0, inverse, fy * size[1] * (1 - inverse))
+                warped = np.asarray(first.transform(size, Image.AFFINE, data, Image.BILINEAR), dtype=np.float32)
+                error = float(np.mean((warped - target) ** 2))
+                if best is None or error < best[0]:
+                    best = (error, float(scale), float(fx), float(fy))
+    return best[1:]
+
+
+def _aligned_psnr(first_png, second_png, reach=2):
+    """PSNR of the interior of two frames, taking the best shift within ``reach`` px."""
+    import math
+
+    import numpy as np
+
+    with Image.open(first_png) as a, Image.open(second_png) as b:
+        first = np.asarray(a.convert("L"), dtype=np.float32)
+        second = np.asarray(b.convert("L"), dtype=np.float32)
+    margin = 10
+    best = min(
+        float(np.mean((first[margin:-margin, margin:-margin]
+                       - np.roll(np.roll(second, dy, 0), dx, 1)[margin:-margin, margin:-margin]) ** 2))
+        for dx in range(-reach, reach + 1) for dy in range(-reach, reach + 1)
+    )
+    return 99.0 if best == 0 else 10 * math.log10(255 ** 2 / best)
+
+
+def _end_frames_of(clip, folder, name):
+    first = _frame(clip, 0, folder / f"{name}_first.png")
+    last = folder / f"{name}_last.png"
+    # Frames are 0.1 s apart at 10 fps, so seek further back than one frame.
+    _ff(["-sseof", "-0.15", "-i", str(clip), "-update", "1", "-frames:v", "1", str(last)])
+    return first, last
+
+
+@pytest.mark.parametrize("motion", ["zoom_in", "zoom_out"])
+def test_both_engines_end_on_the_same_last_frame(project, tmp_path, motion):
+    image = project / "assets" / "a.png"
+    ends = {}
+    for engine in ("zoompan", "scale_crop"):
+        clip = tmp_path / f"{engine}.mp4"
+        sp.render_image_clip(image, clip, duration=4, width=270, height=480, fps=10,
+                             motion=motion, engine=engine)
+        ends[engine] = _end_frames_of(clip, tmp_path, engine)
+    # The engines round the crop window differently, so they can differ by about one
+    # pixel; compare after allowing a shift of up to 2 px. The old top-left anchoring
+    # was off by tens of pixels and fails this by a wide margin.
+    for index in (0, 1):
+        assert _aligned_psnr(ends["zoompan"][index], ends["scale_crop"][index]) > 30
+
+
+@pytest.mark.parametrize("engine", ["zoompan", "scale_crop"])
+@pytest.mark.parametrize("motion", ["zoom_in", "zoom_out"])
+def test_zoom_is_centred_on_the_frame(project, tmp_path, engine, motion):
+    clip = tmp_path / "zoom.mp4"
+    sp.render_image_clip(project / "assets" / "a.png", clip, duration=4, width=270, height=480,
+                         fps=10, motion=motion, engine=engine)
+    first, last = _end_frames_of(clip, tmp_path, "zoom")
+    # Zooming in maps first onto last; zooming out maps last onto first.
+    scale, fx, fy = _fit_zoom(*((first, last) if motion == "zoom_in" else (last, first)))
+    assert 1.03 <= scale <= 1.25
+    assert abs(fx - 0.5) <= 0.1 and abs(fy - 0.5) <= 0.1
+
+
+def test_contain_blur_fills_the_bars_with_a_blurred_copy(project):
+    _write(project, [_scene("s1", asset="wide.png", fit="contain_blur")])
+    frame = _frame(_build(project)["output"], 0.5, project / "contain.png")
+    with Image.open(frame) as image:
+        top = image.convert("L").crop((0, 0, 270, 40))
+        assert sum(top.getdata()) / (270 * 40) > 25
+
+
+def _phone_photo(path):
+    """A phone-style photo: stored landscape (2000x1500) with EXIF orientation 6, so it
+    is an upright 1500x2000 portrait when displayed (red top, blue bottom, white border)."""
+    from PIL import ImageDraw
+
+    upright = Image.new("RGB", (1500, 2000), (128, 128, 128))
+    draw = ImageDraw.Draw(upright)
+    draw.rectangle((0, 0, 1499, 499), fill=(220, 0, 0))
+    draw.rectangle((0, 1500, 1499, 1999), fill=(0, 0, 220))
+    draw.ellipse((350, 750, 1150, 1250), fill=(0, 0, 0))
+    draw.rectangle((0, 0, 1499, 1999), outline=(255, 255, 255), width=14)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    upright.rotate(90, expand=True).save(path, quality=95, exif=exif.tobytes())
+
+
+def _rotated_video(path):
+    """A 400x300 video whose display matrix turns it 90 degrees, as phones write it.
+    ffmpeg 5.1 ignores the old rotate=90 metadata, so the track header is patched."""
+    import struct
+
+    plain = path.with_suffix(".plain.mp4")
+    _ff(["-f", "lavfi", "-i", "testsrc=s=400x300:r=10:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(plain)])
+    data = bytearray(plain.read_bytes())
+    start = data.index(b"tkhd") - 4
+    version = data[start + 8]
+    offset = start + 8 + 4 + (20 if version == 0 else 32) + 8 + 8
+    data[offset:offset + 36] = struct.pack(">9i", 0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000)
+    path.write_bytes(bytes(data))
+
+
+def test_rotated_photo_probes_as_upright(project):
+    _phone_photo(project / "assets" / "phone.jpg")
+    with Image.open(project / "assets" / "phone.jpg") as stored:
+        assert stored.size == (2000, 1500)
+    info = sp.probe_visual(project / "assets" / "phone.jpg")
+    assert (info.width, info.height) == (1500, 2000)
+
+
+def test_rotated_phone_video_probes_the_same_way(project):
+    _rotated_video(project / "assets" / "phone.mp4")
+    info = sp.probe_visual(project / "assets" / "phone.mp4")
+    assert (info.kind, info.width, info.height) == ("video", 300, 400)
+
+
+def test_unrotated_pictures_still_probe_as_stored(project):
+    assert (sp.probe_visual(project / "assets" / "a.png").width, sp.probe_visual(project / "assets" / "a.png").height) == (270, 480)
+    wide = sp.probe_visual(project / "assets" / "wide.png")
+    assert (wide.width, wide.height) == (320, 160)
+    clip = sp.probe_visual(project / "assets" / "clip.mp4")
+    assert (clip.width, clip.height) == (270, 480)
+
+
+def _runs(values):
+    found, start, previous = [], None, None
+    for value in values:
+        if start is None:
+            start = previous = value
+        elif value == previous + 1:
+            previous = value
+        else:
+            found.append((start, previous))
+            start = previous = value
+    if start is not None:
+        found.append((start, previous))
+    return found
+
+
+def test_contain_blur_picture_box_of_a_rotated_photo_is_1080_by_1440(project):
+    _phone_photo(project / "assets" / "phone.jpg")
+    _write(project, [_scene("s1", asset="phone.jpg", fit="contain_blur", motion="static")],
+           settings={"width": 1080, "height": 1920, "fps": 10})
+    frame = _frame(_build(project)["output"], 0.5, project / "phone_contain.png")
+    with Image.open(frame) as image:
+        image = image.convert("RGB")
+        assert image.size == (1080, 1920)
+        column = [image.getpixel((540, y)) for y in range(1920)]
+        row = [image.getpixel((x, 960)) for x in range(1080)]
+    # The picture's sharp white border marks its box; the blurred background never gets that bright.
+    rows = _runs([y for y, pixel in enumerate(column) if min(pixel) >= 245])
+    columns = _runs([x for x, pixel in enumerate(row) if min(pixel) >= 245])
+    assert len(rows) == 2, rows
+    assert 238 <= rows[0][0] <= 246 and 1674 <= rows[1][1] <= 1682   # rows 240 to 1680
+    assert columns[0][0] <= 4 and columns[-1][1] >= 1075             # full width
+    assert column[200][0] > column[200][2]                           # blurred red above
+    assert column[1720][2] > column[1720][0]                         # blurred blue below
+
+
+def test_contain_blur_works_for_videos_too(project):
+    _write(project, [_scene("s1", asset="clip.mp4", fit="contain_blur")])
+    assert abs(_duration(_build(project)["output"]) - 1.4) < 0.2
+
+
+# -- transitions, pauses and sync -----------------------------------------
+
+def _sync(path):
+    return abs(_stream_duration(path, "v:0") - _stream_duration(path, "a:0"))
+
+
+def test_transition_shortens_the_timeline_by_the_overlap(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.25}),
+              _scene("s2", "two.wav", asset="b.png"), _scene("s3", "three.wav")]
+    _write(project, scenes)
+    result = _build(project)
+    # 14 + 9 + 13 frames at 10 fps, minus a 2-frame overlap (0.25 s rounds to 2 frames).
+    assert result["frames"] == 34
+    assert abs(_duration(result["output"]) - 3.4) < 0.15
+    assert _sync(result["output"]) < 0.1
+
+
+@pytest.mark.parametrize("kind", [k for k in sp.TRANSITION_TYPES if k != "cut"])
+def test_every_transition_type_keeps_length_and_sync(project, kind):
+    _write(project, [_scene("s1", transition={"type": kind, "duration": 0.3}), _scene("s2", "two.wav", asset="b.png")])
+    result = _build(project)
+    assert result["frames"] == 14 + 9 - 3
+    assert abs(_duration(result["output"]) - 2.0) < 0.15
+    assert _sync(result["output"]) < 0.1
+
+
+@pytest.mark.parametrize("duration", [0.2, 0.33, 0.5, 0.71])
+def test_fractional_transition_durations(project, duration):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": duration}),
+                     _scene("s2", "two.wav", asset="b.png")])
+    result = _build(project)
+    shared = round(duration * 10)
+    assert result["frames"] == 14 + 9 - shared
+    assert abs(_duration(result["output"]) - result["frames"] / 10) < 0.15
+    assert _sync(result["output"]) < 0.1
+
+
+@pytest.mark.parametrize("duration,accepted", [(0.1, False), (0.14, False), (0.15, True), (0.2, True)])
+def test_transition_under_two_frames_is_rejected_before_rendering(project, duration, accepted):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": duration}),
+                     _scene("s2", "two.wav", asset="b.png")])
+    if accepted:
+        assert sp.load_manifest(project).scenes[0].transition.duration == duration
+        return
+    with pytest.raises(sp.ManifestError) as caught:
+        _build(project)
+    message = str(caught.value)
+    assert "under 2 frames at 10 fps" in message and "minimum" in message and "0.2s" in message
+    assert not (project / "render").exists()
+    assert not (project / ".scene_cache").exists()
+
+
+def test_minimum_transition_follows_the_frame_rate(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.1}),
+                     _scene("s2", "two.wav", asset="b.png")], settings={**SETTINGS, "fps": 30})
+    assert sp.load_manifest(project).scenes[0].transition.duration == 0.1
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.1}),
+                     _scene("s2", "two.wav", asset="b.png")], settings={**SETTINGS, "fps": 24})
+    assert sp.load_manifest(project).scenes[0].transition.duration == 0.1
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.1}),
+                     _scene("s2", "two.wav", asset="b.png")], settings={**SETTINGS, "fps": 12})
+    assert "minimum" in _errors(project)
+
+
+def test_picture_and_narration_stay_in_sync_over_many_transitions(project):
+    scenes = [_scene(f"s{i}", ("one.wav", "two.wav", "three.wav")[i % 3],
+                     transition={"type": "crossfade", "duration": 0.2} if i < 7 else None) for i in range(8)]
+    for scene in scenes:
+        if scene.get("transition") is None:
+            scene.pop("transition", None)
+    _write(project, scenes)
+    result = _build(project)
+    assert abs(_duration(result["output"]) - result["frames"] / 10) < 0.2
+    assert _sync(result["output"]) < 0.15
+
+
+def test_transition_longer_than_the_scene_allows_is_rejected(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.6}),
+                     _scene("s2", "two.wav", transition={"type": "crossfade", "duration": 0.6}),
+                     _scene("s3", "three.wav")])
+    with pytest.raises(sp.PipelineError, match="transitions need"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_pause_after_extends_the_scene(project):
+    _write(project, [_scene("s1", pause_after=0.5), _scene("s2", "two.wav", asset="b.png")])
+    result = _build(project)
+    assert result["frames"] == round((1.37 + 0.5) * 10) + 9
+    assert abs(_duration(result["output"]) - result["frames"] / 10) < 0.15
+    assert _sync(result["output"]) < 0.1
+
+
+def test_transition_over_speech_warns_and_a_pause_silences_the_warning(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.5}),
+                     _scene("s2", "two.wav", asset="b.png")])
+    assert "overlaps the end of its narration" in _build(project)["warnings"][0]
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.5}, pause_after=0.5),
+                     _scene("s2", "two.wav", asset="b.png")])
+    assert _build(project)["warnings"] == []
+
+
+# -- background music ------------------------------------------------------
+
+@pytest.mark.parametrize("music,note", [("music_short.wav", "loops"), ("music_long.wav", "is trimmed")])
+def test_music_length_matches_the_video(project, music, note):
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", asset="b.png")], bgm={"file": music, "volume": 0.5})
+    result = _build(project)
+    assert abs(_duration(result["output"]) - 2.3) < 0.15, note
+    assert abs(_stream_duration(result["output"], "a:0") - 2.3) < 0.15
+
+
+def test_music_is_ducked_under_the_narration(project):
+    ducking = {"amount": 12, "attack": 20, "release": 200}
+    scene = _scene("s1", "voice200.wav", pause_after=2.0)
+    _write(project, [scene], bgm={"file": "music_long.wav", "volume": 1.0, "ducking": ducking})
+    ducked = Path(_build(project)["output"])
+    shutil.copyfile(ducked, project / "ducked.mp4")
+    _write(project, [scene], bgm={"file": "music_long.wav", "volume": 1.0})
+    flat = _build(project)["output"]
+    spoken, silent = (0.5, 0.7), (2.5, 0.7)
+    gap = _level(project / "ducked.mp4", *silent) - _level(project / "ducked.mp4", *spoken)
+    assert gap > 6
+    assert abs(_level(flat, *silent) - _level(flat, *spoken)) < 3
+
+
+def test_duck_ratio_grows_with_the_amount():
+    assert scene_post.duck_ratio(0) == 1.0
+    assert scene_post.duck_ratio(6) < scene_post.duck_ratio(12) < scene_post.duck_ratio(18) <= 20
+
+
+def test_music_file_must_exist_and_have_audio(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_short.wav"})
+    (project / "audio" / "music_short.wav").write_bytes(b"not audio")
+    with pytest.raises(sp.ManifestError, match="bgm"):
+        sp.inspect_media(sp.load_manifest(project), project)
+
+
+# -- caching across a project ----------------------------------------------
+
+def test_changing_one_scene_rebuilds_it_its_junctions_and_the_later_stages(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.2}),
+              _scene("s2", "two.wav", asset="b.png", transition={"type": "crossfade", "duration": 0.2}),
+              _scene("s3", "three.wav")]
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3, "ducking": {}})
+    first = _build(project)
+    assert not any(first["post_stages"].values())
+    again = _build(project)
+    assert all(again["post_stages"].values())
+
+    scenes[1]["text_cards"] = [{"text": "Changed", "start": 0.2, "end": 0.6}]
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3, "ducking": {}})
+    picture_only = _build(project)
+    assert _rebuilt(picture_only) == {"s2:picture", "s1>s2:picture", "s2>s3:picture", "join:picture", "final"}
+    assert all(picture_only["stages"].values())
+
+    scenes[0]["audio"] = "three.wav"
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3, "ducking": {}})
+    audio_change = _build(project)
+    rebuilt = _rebuilt(audio_change)
+    assert {"s1:narration", "s1:picture", "s1>s2:narration", "s1>s2:picture", "join:picture",
+            "join:narration", "final"} <= rebuilt
+    assert "s3:picture" not in rebuilt and "s3:narration" not in rebuilt
+
+
+def test_changing_the_music_rebuilds_only_the_final_mux(project):
+    scenes = [_scene("s1"), _scene("s2", "two.wav", asset="b.png")]
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3})
+    _build(project)
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.6})
+    assert _rebuilt(_build(project)) == {"final"}
