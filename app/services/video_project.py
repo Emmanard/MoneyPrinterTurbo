@@ -303,8 +303,8 @@ class VideoProject:
         project_id = _identifier(request["project_id"])
         settings = RenderSettings.parse(request.get("settings", {}))
         raw_scenes = request.get("scenes")
-        if not isinstance(raw_scenes, list) or not 1 <= len(raw_scenes) <= 100:
-            raise ProjectError("provide between 1 and 100 scenes")
+        if not isinstance(raw_scenes, list) or not 1 <= len(raw_scenes) <= 1000:
+            raise ProjectError("provide between 1 and 1000 scenes")
         scenes = []
         for raw in raw_scenes:
             if not isinstance(raw, dict) or set(raw) - {
