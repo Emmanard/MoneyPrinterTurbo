@@ -84,6 +84,7 @@ to anything other than null is an error.
 | `trim_padding` | used | Seconds of silence kept after the last sound, 0 to 2, default 0.15 |
 | `captions` | used | Default caption settings for every scene: `{enabled, mode, style}` |
 | `text_card_style` | used | Default style for every text card |
+| `loudness` | used | `{target_lufs, true_peak_db}`: normalise the final audio; off unless set. Defaults -14 LUFS and -1.5 dBTP (target -50 to -5, peak -9 to 0) |
 
 ### `bgm`
 
@@ -293,6 +294,28 @@ rule 2).
   ducks a little more. `attack` and `release` set how fast it ducks and recovers.
 - The mix is limited at -0.45 dBFS to avoid clipping.
 
+### Loudness
+
+- Off unless `settings.loudness` is set. The normal output `out/<name>.mp4` is written as
+  before; the normalised copy is written next to it as `out/<name>.loudnorm.mp4`, with the
+  report in `out/<name>.loudnorm.json`. The video stream is copied, not re-encoded.
+- Two passes of ffmpeg `loudnorm` (LRA target 11) on the final mixed audio: the first
+  measures it, the second applies a constant gain (`linear=true`) and encodes AAC 192k
+  at 48 kHz. The result is measured again from the written file.
+- The build result and the `.loudnorm.json` file report: `mode`, `target_lufs`,
+  `true_peak_db`, `input` and `output` (each `lufs`, `true_peak_db`, `lra`),
+  `predicted_output` (loudnorm's own estimate before the AAC encode) and `ffmpeg_label`.
+  `output` is measured from the file that was written.
+- `mode` is `linear` when one constant gain was applied, and `dynamic` when it was not.
+  Linear needs the gain that reaches the target to keep the true peak under the limit. If it
+  would not, loudnorm falls back to dynamic processing, which can land well away from the
+  target on short or steady audio. ffmpeg's own label says "linear" even in that case, so
+  `mode` is decided from the measurements (peak headroom, and whether the output equals
+  the input plus that gain) and the raw label is kept only as `ffmpeg_label`.
+- Warnings are added to the build result when the output is more than 1 LU from the
+  target or the true peak is more than 0.3 dB over the limit after the AAC encode.
+- Silent audio cannot be measured and fails the build with a clear message.
+
 ### Caching and what rebuilds
 
 Each stage's key includes all of its inputs (content of the source files, the
@@ -304,6 +327,7 @@ text, style, frame counts, settings), so a change rebuilds only what depends on 
 | A scene's narration or audio | X's renderer stages, X's picture and narration segments, its junctions, both joins, the final mix |
 | A transition between X and Y | the junction (and the neighbouring bodies' cut points), both joins, the final mix |
 | `bgm` settings or file | the final mix only |
+| `settings.loudness` | the loudness stage only (the final mix is reused) |
 | Another scene's anything | nothing of X's |
 
 Any manifest that uses captions, text cards, transitions, `pause_after` or `bgm`

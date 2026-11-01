@@ -78,7 +78,11 @@ USED_SCENE_FIELDS = frozenset({
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
 TEXT_SETTINGS = ("captions", "text_card_style")
-USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS
+USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness",)
+
+# Final loudness normalisation (two-pass loudnorm), off unless settings.loudness is set.
+DEFAULT_TARGET_LUFS = -14.0
+DEFAULT_TRUE_PEAK_DB = -1.5
 DEFAULT_SETTINGS = {"width": 1080, "height": 1920, "fps": 30, "narration_volume": 1.0}
 
 # Several visuals in one scene.
@@ -145,6 +149,12 @@ class Ducking:
 
 
 @dataclass(frozen=True)
+class Loudness:
+    target_lufs: float
+    true_peak_db: float
+
+
+@dataclass(frozen=True)
 class Bgm:
     file: str
     volume: float
@@ -183,6 +193,7 @@ class SceneManifest:
     captions: dict | None = None
     text_card_style: dict | None = None
     bgm: Bgm | None = None
+    loudness: Loudness | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +270,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     trim = TrimSettings(True, DEFAULT_TRIM_PADDING)
     caption_defaults: dict = {}
     card_defaults: dict = {}
+    loudness = None
     if not isinstance(settings_raw, dict):
         errors.append("settings: must be an object")
     else:
@@ -286,6 +298,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
             errors.append(f"settings.trim_padding: must be a number from 0 to {MAX_TRIM_PADDING}")
             padding = DEFAULT_TRIM_PADDING
         trim = TrimSettings(enabled, float(padding))
+        loudness = _parse_loudness(settings_raw.get("loudness"), errors)
 
     voice_name = None
     voice_rate = 1.0
@@ -405,7 +418,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     if errors or settings is None:
         raise ManifestError("\n".join(dict.fromkeys(errors)))
     return SceneManifest(project_id, voice_name, voice_rate, settings, trim, tuple(scenes),
-                         caption_defaults, card_defaults, bgm)
+                         caption_defaults, card_defaults, bgm, loudness)
 
 
 def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> tuple[AssetRef, ...]:
@@ -477,6 +490,27 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
         )
         return None
     return Transition(kind, float(duration))
+
+
+def _parse_loudness(raw: object, errors: list[str]) -> Loudness | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.append("settings.loudness: must be an object like {target_lufs, true_peak_db}")
+        return None
+    for key in raw:
+        if key not in ("target_lufs", "true_peak_db"):
+            errors.append(f"settings.loudness: unknown field: {key}")
+    target = raw.get("target_lufs", DEFAULT_TARGET_LUFS)
+    peak = raw.get("true_peak_db", DEFAULT_TRUE_PEAK_DB)
+    ok = True
+    if not _is_number(target) or not -50 <= target <= -5:
+        errors.append("settings.loudness.target_lufs: must be a number from -50 to -5")
+        ok = False
+    if not _is_number(peak) or not -9 <= peak <= 0:
+        errors.append("settings.loudness.true_peak_db: must be a number from -9 to 0")
+        ok = False
+    return Loudness(float(target), float(peak)) if ok else None
 
 
 def _parse_bgm(raw: object, folder: Path, errors: list[str]) -> Bgm | None:
@@ -1112,7 +1146,7 @@ def ensure_scene_visual(project: Path, manifest: SceneManifest, scene: Scene,
 def uses_post(manifest: SceneManifest) -> bool:
     """True when the manifest needs the post stages: captions, text cards,
     transitions, pauses or music. Without any of them the original path runs."""
-    if manifest.bgm is not None:
+    if manifest.bgm is not None or manifest.loudness is not None:
         return True
     for scene in manifest.scenes:
         if scene.pause_after > 0 or scene.text_cards:
@@ -1173,6 +1207,11 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
         if existing.exists() and not overwrite:
             raise PipelineError(
                 f"out/{target_name}.mp4 already exists; choose another --output-name or pass --overwrite"
+            )
+        loud = project / "out" / f"{target_name}.loudnorm.mp4"
+        if manifest.loudness is not None and loud.exists() and not overwrite:
+            raise PipelineError(
+                f"out/{target_name}.loudnorm.mp4 already exists; choose another --output-name or pass --overwrite"
             )
     infos = inspect_media(manifest, project)
     scenes_request = []
@@ -1238,6 +1277,8 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
                                    output_name=target_name)
         result.update(output=post["output"], post_stages=post["stages"], frames=post["frames"],
                       seconds=post["seconds"], warnings=post["warnings"])
+        if "loudness" in post:
+            result["loudness"] = post["loudness"]
         return result
     exported = Path(status["export"]["path"])
     out_dir = project / "out"

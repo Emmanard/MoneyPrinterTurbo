@@ -193,6 +193,10 @@ def build_plan(project: Path) -> dict:
         "total_frames": sum(known) - sum(tails) if all_known else None,
         "total_seconds": _round((sum(known) - sum(tails)) / fps) if all_known else None,
         "transition_frames": sum(tails),
+        "loudness": None if manifest.loudness is None else (
+            f"{manifest.loudness.target_lufs:g} LUFS, true peak {manifest.loudness.true_peak_db:g} dBTP"),
+        "loudness": None if manifest.loudness is None else
+        f"{manifest.loudness.target_lufs:g} LUFS, true peak {manifest.loudness.true_peak_db:g} dBTP",
         "problems": sum(len(e["problems"]) for e in entries),
         "warnings": sum(len(e["warnings"]) for e in entries),
     }
@@ -246,5 +250,10 @@ def format_text(plan: dict) -> str:
         for text in e["problems"]:
             lines.append(f"  PROBLEM: {text}")
     lines.append("")
+    if summary.get("loudness"):
+        lines.append(f"loudness: normalise to {summary['loudness']} (second file out/<name>.loudnorm.mp4, report .loudnorm.json)")
+    if summary["loudness"]:
+        lines.append(f"loudness: normalise to {summary['loudness']} "
+                     "(written as out/<name>.loudnorm.mp4 and out/<name>.loudnorm.json)")
     lines.append(f"{summary['problems']} problem(s), {summary['warnings']} warning(s)")
     return "\n".join(lines)

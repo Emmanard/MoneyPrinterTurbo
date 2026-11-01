@@ -882,3 +882,134 @@ def test_output_name_also_works_on_the_post_path(project):
     result = sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="alt")
     assert Path(result["output"]).name == "alt.mp4" and (project / "out" / "alt.mp4").is_file()
     assert not (project / "out" / "ep.mp4").exists()
+
+
+# -- stage B: loudness ------------------------------------------------------
+
+def _loud(root, target=-20, peak=-2, **loudness):
+    scenes = [_scene("s1"), _scene("s2", "two.wav", "b.png")]
+    settings = {**SETTINGS, "loudness": {"target_lufs": target, "true_peak_db": peak, **loudness}}
+    manifest = {"schema_version": 1, "project_id": "ep", "settings": settings, "scenes": scenes}
+    (root / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _video_md5(path):
+    done = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:v:0",
+                           "-c", "copy", "-f", "md5", "-"], capture_output=True, text=True)
+    return done.stdout.strip()
+
+
+@pytest.mark.parametrize("value,message", [
+    ("loud", "settings.loudness: must be an object"),
+    ({"target_lufs": "high"}, "settings.loudness.target_lufs: must be a number from -50 to -5"),
+    ({"target_lufs": -2}, "settings.loudness.target_lufs"),
+    ({"true_peak_db": 1}, "settings.loudness.true_peak_db: must be a number from -9 to 0"),
+    ({"true_peek_db": -1}, "settings.loudness: unknown field: true_peek_db"),
+])
+def test_loudness_setting_is_validated(project, value, message):
+    manifest = {"schema_version": 1, "project_id": "ep", "settings": {**SETTINGS, "loudness": value},
+                "scenes": [_scene("s1")]}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert message in _errors(project)
+
+
+def test_loudness_defaults_apply_when_only_one_value_is_given(project):
+    manifest = {"schema_version": 1, "project_id": "ep", "settings": {**SETTINGS, "loudness": {}},
+                "scenes": [_scene("s1")]}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loudness = sp.load_manifest(project).loudness
+    assert (loudness.target_lufs, loudness.true_peak_db) == (-14.0, -1.5)
+
+
+def test_loudness_is_off_unless_set(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "volume": 0.3})
+    assert sp.load_manifest(project).loudness is None
+    result = _build(project)
+    assert "loudness" not in result and "loudness" not in result["post_stages"]
+    assert not list((project / "out").glob("*.loudnorm.*"))
+
+
+def test_loudness_writes_a_second_file_with_the_report(project):
+    _loud(project)
+    result = _build(project)
+    report = result["loudness"]
+    normal, loud = Path(result["output"]), Path(report["file"])
+    assert normal.name == "ep.mp4" and loud.name == "ep.loudnorm.mp4" and loud.is_file()
+    assert json.loads(Path(report["report"]).read_text()) == {
+        k: v for k, v in report.items() if k not in ("file", "report")}
+    assert report["mode"] in ("linear", "dynamic")
+    assert report["ffmpeg_label"] in ("linear", "dynamic", "")
+    for side in ("input", "output", "predicted_output"):
+        assert set(report[side]) == {"lufs", "true_peak_db", "lra"}
+    assert report["output"]["lufs"] == pytest.approx(-20, abs=1.5)
+    # the original build output is not replaced by the normalised one
+    assert _video_md5(normal) == _video_md5(loud)
+    assert _duration(loud) == pytest.approx(_duration(normal), abs=0.1)
+
+
+def test_loudness_mode_is_linear_when_the_gain_fits_and_dynamic_when_it_does_not(project):
+    _loud(project, target=-24, peak=-2)
+    assert _build(project)["loudness"]["mode"] == "linear"
+    _loud(project, target=-8, peak=-9)
+    report = _build(project)["loudness"]
+    assert report["mode"] == "dynamic"
+    # loudnorm could not reach the target here; the report and a warning say so
+    assert abs(report["output"]["lufs"] - report["target_lufs"]) > 1
+    assert any("more than" in text for text in scene_post.loudness_warnings(report))
+
+
+def test_loudness_stage_is_cached_and_follows_its_settings(project):
+    _loud(project)
+    first = _build(project)
+    assert first["post_stages"]["loudness"] is False
+    again = _build(project)
+    assert again["post_stages"]["loudness"] is True
+    assert again["loudness"]["output"] == first["loudness"]["output"]
+    _loud(project, target=-22)
+    changed = _build(project)
+    assert _rebuilt(changed) == {"loudness"}
+    assert changed["loudness"]["target_lufs"] == -22
+
+
+def test_loudnorm_mode_is_decided_from_gain_and_peak_not_from_ffmpeg_label():
+    target = sp.Loudness(-14.0, -1.5)
+    quiet = {"lufs": -20.0, "true_peak_db": -12.0, "lra": 3.0}
+    # gain of +6 dB keeps the peak at -6, under the limit, and the output shows +6
+    assert scene_post.loudnorm_mode(quiet, {"lufs": -14.1, "true_peak_db": -6.2, "lra": 3.0}, target) == "linear"
+    # same gain but the output did not move by that gain: loudnorm fell back
+    assert scene_post.loudnorm_mode(quiet, {"lufs": -22.0, "true_peak_db": -14.0, "lra": 1.0}, target) == "dynamic"
+    # peaky input: +6 dB would put the peak at +1.0 dBTP, over the limit
+    peaky = {"lufs": -20.0, "true_peak_db": -5.0, "lra": 3.0}
+    assert scene_post.loudnorm_mode(peaky, {"lufs": -14.0, "true_peak_db": 1.0, "lra": 3.0}, target) == "dynamic"
+
+
+def test_loudness_warnings_name_what_is_off():
+    report = {"mode": "dynamic", "target_lufs": -14.0, "true_peak_db": -1.5,
+              "output": {"lufs": -17.2, "true_peak_db": -0.4, "lra": 5.0}}
+    text = " ".join(scene_post.loudness_warnings(report))
+    assert "-17.2 LUFS" in text and "dynamic" in text and "-0.4 dBTP" in text
+    report["output"] = {"lufs": -14.1, "true_peak_db": -1.6, "lra": 5.0}
+    assert scene_post.loudness_warnings(report) == []
+
+
+def test_loudnorm_output_that_has_no_json_is_an_error():
+    with pytest.raises(sp.PipelineError, match="no measurements"):
+        scene_post._loudnorm_json("nothing useful here", "pass")
+    with pytest.raises(sp.PipelineError, match="silent"):
+        scene_post._number({"input_i": "-inf"}, "input_i", "pass")
+
+
+def test_loudness_with_output_name_and_overwrite_check(project):
+    _loud(project)
+    sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take3")
+    assert (project / "out" / "take3.loudnorm.mp4").is_file()
+    assert (project / "out" / "take3.loudnorm.json").is_file()
+    (project / "out" / "take3.mp4").unlink()
+    with pytest.raises(sp.PipelineError, match="take3.loudnorm.mp4 already exists"):
+        sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take3")
+
+
+def test_plan_shows_the_loudness_target(project, capsys):
+    _loud(project, target=-16, peak=-1)
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    assert "normalise to -16 LUFS, true peak -1 dBTP" in capsys.readouterr().out

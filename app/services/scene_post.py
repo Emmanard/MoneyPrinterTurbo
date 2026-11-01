@@ -23,6 +23,7 @@ stay in sync.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -379,6 +380,160 @@ def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, 
     return _ensure(ctx, "final", key, ".mp4", "final", build)
 
 
+# -- loudness -------------------------------------------------------------
+
+LOUDNESS_VERSION = "loud-v1"
+LOUDNESS_LRA = 11.0
+LOUDNESS_OFF_TARGET_LU = 1.0
+LOUDNESS_PEAK_SLACK_DB = 0.3
+
+
+def _loudnorm_json(text: str, what: str) -> dict:
+    """The JSON block loudnorm prints at the end of a run."""
+    end = text.rfind("}")
+    start = text.rfind("{", 0, end + 1) if end >= 0 else -1
+    if start < 0:
+        raise PipelineError(f"{what}: loudnorm printed no measurements")
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError as exc:
+        raise PipelineError(f"{what}: could not read the loudnorm measurements: {exc}") from exc
+    return data
+
+
+def _number(data: dict, key: str, what: str) -> float:
+    try:
+        value = float(data[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PipelineError(f"{what}: loudnorm result has no usable {key}") from exc
+    if value != value or value in (float("inf"), float("-inf")):
+        raise PipelineError(f"{what}: the audio is silent or too quiet to measure ({key} is {data[key]})")
+    return value
+
+
+def _loudnorm_run(arguments: list[str], cwd: Path, what: str) -> dict:
+    """Run ffmpeg with loudnorm's info output visible and return its JSON."""
+    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-threads", "1", "-filter_threads", "1",
+               *arguments]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, cwd=str(cwd),
+                              timeout=COMMAND_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PipelineError(f"{what}: {exc}") from exc
+    if done.returncode:
+        raise PipelineError(f"{what} failed: {done.stderr[-2000:].strip()}")
+    return _loudnorm_json(done.stderr, what)
+
+
+def _target_filter(loudness) -> str:
+    return f"I={loudness.target_lufs:g}:TP={loudness.true_peak_db:g}:LRA={LOUDNESS_LRA:g}"
+
+
+def measure_loudness(path: Path, loudness, cwd: Path, what: str) -> dict:
+    """Integrated loudness (LUFS), true peak (dBTP) and loudness range (LU) of a file's audio."""
+    data = _loudnorm_run(
+        [*_input(path), "-vn", "-af", f"loudnorm={_target_filter(loudness)}:print_format=json",
+         "-f", "null", "-"], cwd, what)
+    return {
+        "lufs": _number(data, "input_i", what),
+        "true_peak_db": _number(data, "input_tp", what),
+        "lra": _number(data, "input_lra", what),
+    }
+
+
+def loudness_key(loudness, final_key: str, final_sha: str) -> str:
+    return _key(LOUDNESS_VERSION, final_key, final_sha, loudness.target_lufs, loudness.true_peak_db,
+                LOUDNESS_LRA)
+
+
+LINEAR_GAIN_TOLERANCE_DB = 0.5
+
+
+def loudnorm_mode(before: dict, after: dict, loudness) -> str:
+    """"linear" when loudnorm applied one constant gain, else "dynamic".
+
+    ffmpeg labels both passes "linear" even when it falls back to dynamic
+    processing, so the label is not used. Linear mode needs the gain that reaches the
+    target to keep the true peak under the limit; it also has to have produced
+    exactly that gain (input plus gain equals the measured output).
+    """
+    gain = loudness.target_lufs - before["lufs"]
+    if before["true_peak_db"] + gain > loudness.true_peak_db:
+        return "dynamic"
+    if abs(after["lufs"] - (before["lufs"] + gain)) > LINEAR_GAIN_TOLERANCE_DB:
+        return "dynamic"
+    return "linear"
+
+
+def _normalise(final: Path, loudness, work: Path, staged: Path, seconds: float) -> dict:
+    """Two-pass loudnorm on the final audio with the video copied; returns the report."""
+    before = _loudnorm_run(
+        [*_input(final), "-vn", "-af", f"loudnorm={_target_filter(loudness)}:print_format=json",
+         "-f", "null", "-"], work, "loudness pass 1")
+    measured = {k: _number(before, k, "loudness pass 1")
+                for k in ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")}
+    graph = (f"loudnorm={_target_filter(loudness)}:measured_I={measured['input_i']}:"
+             f"measured_TP={measured['input_tp']}:measured_LRA={measured['input_lra']}:"
+             f"measured_thresh={measured['input_thresh']}:offset={measured['target_offset']}:"
+             "linear=true:print_format=json")
+    applied = _loudnorm_run(
+        [*_input(final), "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-af", graph,
+         "-ar", str(SAMPLE_RATE), "-c:a", "aac", "-b:a", "192k", "-t", f"{seconds:.6f}",
+         "-movflags", "+faststart", str(staged)], work, "loudness pass 2")
+    after = measure_loudness(staged, loudness, work, "loudness check")
+    input_side = {"lufs": measured["input_i"], "true_peak_db": measured["input_tp"],
+                  "lra": measured["input_lra"]}
+    return {
+        "mode": loudnorm_mode(input_side, after, loudness),
+        "ffmpeg_label": str(applied.get("normalization_type", "")).strip().lower(),
+        "target_lufs": loudness.target_lufs,
+        "true_peak_db": loudness.true_peak_db,
+        "input": input_side,
+        "output": after,
+        "predicted_output": {"lufs": _number(applied, "output_i", "loudness pass 2"),
+                             "true_peak_db": _number(applied, "output_tp", "loudness pass 2"),
+                             "lra": _number(applied, "output_lra", "loudness pass 2")},
+    }
+
+
+def loudness_warnings(report: dict) -> list[str]:
+    warnings = []
+    out = report["output"]
+    if abs(out["lufs"] - report["target_lufs"]) > LOUDNESS_OFF_TARGET_LU:
+        warnings.append(
+            f"loudness: the result is {out['lufs']:.1f} LUFS, more than {LOUDNESS_OFF_TARGET_LU:g} LU "
+            f"from the {report['target_lufs']:g} target ({report['mode']} mode)"
+        )
+    if out["true_peak_db"] > report["true_peak_db"] + LOUDNESS_PEAK_SLACK_DB:
+        warnings.append(
+            f"loudness: the true peak is {out['true_peak_db']:.1f} dBTP, above the "
+            f"{report['true_peak_db']:g} limit after AAC encoding"
+        )
+    return warnings
+
+
+def _loudness_stage(ctx: _Context, manifest: SceneManifest, final: Path, final_key: str,
+                    frames: int) -> tuple[Path, dict]:
+    """Cached normalised copy of the final file and its measured report."""
+    loudness = manifest.loudness
+    key = loudness_key(loudness, final_key, _sha256_file(final))
+    report_path = ctx.post / "loudness" / f"{key}.json"
+    media = ctx.post / "loudness" / f"{key}.mp4"
+    if media.is_file() and not report_path.is_file():
+        media.unlink()
+    seconds = frames / ctx.fps
+
+    def build(work: Path, staged: Path) -> None:
+        report = _normalise(final, loudness, work, staged, seconds)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        part = report_path.with_suffix(".json.part")
+        part.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        os.replace(part, report_path)
+
+    path = _ensure(ctx, "loudness", key, ".mp4", "loudness", build)
+    return path, json.loads(report_path.read_text(encoding="utf-8"))
+
+
 # -- entry point ----------------------------------------------------------
 
 def _artifact(project: Path, entry: dict, suffix: str) -> Path:
@@ -447,6 +602,11 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
     audio, audio_key = _concat(ctx, audio_segments, "audio", ".wav", "join:narration", [])
     count = total_frames(frames, tails)
     final = _final(ctx, manifest, video, video_key, audio, audio_key, count)
+    report = None
+    normalised = None
+    if manifest.loudness is not None:
+        progress("  loudness: measuring and normalising the final audio")
+        normalised, report = _loudness_stage(ctx, manifest, final, _key("final", video_key, audio_key, count), count)
 
     out_dir = project / "out"
     out_dir.mkdir(exist_ok=True)
@@ -458,10 +618,24 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
         os.replace(staged, published)
     finally:
         staged.unlink(missing_ok=True)
-    return {
+    warnings = warnings_for(manifest)
+    result = {
         "output": str(published),
         "stages": dict(ctx.stages),
         "frames": count,
         "seconds": count / settings.fps,
-        "warnings": warnings_for(manifest),
+        "warnings": warnings,
     }
+    if report is not None:
+        loud_media = out_dir / f"{name}.loudnorm.mp4"
+        loud_report = out_dir / f"{name}.loudnorm.json"
+        loud_staged = out_dir / f".{name}.loudnorm.partial.mp4"
+        try:
+            shutil.copyfile(normalised, loud_staged)
+            os.replace(loud_staged, loud_media)
+        finally:
+            loud_staged.unlink(missing_ok=True)
+        loud_report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        warnings.extend(loudness_warnings(report))
+        result["loudness"] = {**report, "file": str(loud_media), "report": str(loud_report)}
+    return result
