@@ -751,3 +751,134 @@ def test_changing_the_music_rebuilds_only_the_final_mux(project):
     _build(project)
     _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.6})
     assert _rebuilt(_build(project)) == {"final"}
+
+
+# -- stage A: per-asset fit, detailed plan, output name --------------------
+
+def _two_wide(first_fit=None, scene_fit=None):
+    first = {"file": "wide.png", "duration": 0.6}
+    if first_fit:
+        first["fit"] = first_fit
+    scene = {"id": "s1", "narration": SAY, "audio": "three.wav",
+             "assets": [first, {"file": "wide.png"}]}
+    if scene_fit:
+        scene["fit"] = scene_fit
+    return scene
+
+
+def test_asset_fit_must_be_a_known_fit(project):
+    scene = _two_wide()
+    scene["assets"][0]["fit"] = "stretch"
+    _write(project, [scene])
+    assert "assets[0].fit: must be one of cover, contain_blur" in _errors(project)
+
+
+def test_asset_fit_overrides_the_scene_fit_for_that_asset_only(project, tmp_path):
+    _write(project, [_two_wide(first_fit="contain_blur", scene_fit="cover")])
+    mixed_out = _build(project)["output"]
+    mixed_early = _frame(mixed_out, 0.3, tmp_path / "mixed_early.png")
+    mixed_late = _frame(mixed_out, 1.0, tmp_path / "mixed_late.png")
+    shutil.rmtree(project / "out")
+    shutil.rmtree(project / "render_v1", ignore_errors=True)
+    _write(project, [_two_wide(scene_fit="contain_blur")])
+    blur_out = _build(project)["output"]
+    blur_early = _frame(blur_out, 0.3, tmp_path / "blur_early.png")
+    blur_late = _frame(blur_out, 1.0, tmp_path / "blur_late.png")
+    # first asset: contain_blur in both builds; second asset: cover vs contain_blur
+    assert _psnr(mixed_early, blur_early) > 40
+    assert _psnr(mixed_late, blur_late) < 30
+
+
+def test_plan_lists_durations_and_cards_against_the_scene_length(project, capsys):
+    scene = _two_wide(first_fit="contain_blur")
+    scene["text_cards"] = [{"text": "Inside", "start": 0.1, "end": 0.9}]
+    _write(project, [scene])
+    assert sp.main(["--project", str(project), "plan"]) == 0
+    entry = json.loads(capsys.readouterr().out)[0]
+    assert entry["visual"] == "multi" and entry["trimmed_seconds"] == pytest.approx(1.3, abs=0.05)
+    assert entry["frames"] == 13 and entry["length_seconds"] == pytest.approx(1.3)
+    first, second = entry["assets"]
+    assert first["fit"] == "contain_blur" and second["fit"] == "cover"
+    assert first["seconds"] == pytest.approx(0.6) and first["starts"] == 0
+    assert second["seconds"] == pytest.approx(0.7, abs=0.05)
+    assert entry["cards"][0]["seconds_before_scene_end"] == pytest.approx(0.4, abs=0.05)
+    assert entry["problems"] == []
+
+
+def test_plan_reports_problems_and_exits_with_one(project, capsys):
+    scene = _scene("s1", text_cards=[{"text": "Late", "start": 0, "end": 30}])
+    two = _scene("s2", "two.wav", text_cards=[
+        {"text": "One", "start": 0.1, "end": 0.6}, {"text": "Two", "start": 0.4, "end": 0.8}])
+    _write(project, [scene, two])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 1
+    text = capsys.readouterr().out
+    assert "PROBLEM: text card 1 ends at 30s but the scene lasts" in text
+    assert "text cards 1 and 2 are on screen together" in text
+    assert "2 problem(s)" in text
+
+
+def test_plan_reports_assets_that_do_not_fit_the_narration(project, capsys):
+    scene = {"id": "s1", "narration": SAY, "audio": "one.wav",
+             "assets": [{"file": "a.png", "duration": 5}, {"file": "b.png"}]}
+    _write(project, [scene])
+    assert sp.main(["--project", str(project), "plan"]) == 1
+    assert json.loads(capsys.readouterr().out)[0]["problems"]
+
+
+def test_plan_writes_nothing_into_the_project(project, capsys):
+    _write(project, [_scene("s1")])
+    before = sorted(str(p.relative_to(project)) for p in project.rglob("*"))
+    sp.main(["--project", str(project), "plan"])
+    capsys.readouterr()
+    assert sorted(str(p.relative_to(project)) for p in project.rglob("*")) == before
+
+
+def test_plan_with_pending_narration_checks_what_it_can(project, capsys):
+    scene = {"id": "s1", "asset": "a.png", "narration": SAY}
+    _write(project, [scene, _scene("s2", "two.wav", "b.png")], voice={"name": "en-US-AriaNeural"})
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    text = capsys.readouterr().out
+    assert "pending" in text and "narration is not generated yet" in text
+
+
+def test_plan_sums_transitions_into_the_total(project, capsys):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.3}), _scene("s2", "two.wav", "b.png")])
+    sp.main(["--project", str(project), "plan"])
+    entry = json.loads(capsys.readouterr().out)[0]
+    assert entry["transition"]["frames"] == 3
+    built = _build(project)
+    assert _duration(built["output"]) == pytest.approx(
+        (14 + 9 - 3) / 10, abs=0.15)
+
+
+def test_output_name_keeps_the_earlier_file(project):
+    _write(project, [_scene("s1")])
+    first = _build(project)["output"]
+    again = sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take2")
+    assert Path(again["output"]).name == "take2.mp4" and Path(first).name == "ep.mp4"
+    assert Path(first).is_file() and Path(again["output"]).is_file()
+
+
+def test_output_name_refuses_to_replace_without_overwrite(project):
+    _write(project, [_scene("s1")])
+    sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take2")
+    before = (project / "out" / "take2.mp4").stat().st_mtime_ns
+    with pytest.raises(sp.PipelineError, match="already exists"):
+        sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take2")
+    assert (project / "out" / "take2.mp4").stat().st_mtime_ns == before
+    sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take2", overwrite=True)
+
+
+@pytest.mark.parametrize("name", ["", "a/b", "..", ".hidden", "x y", "a.mp4", "n" * 65])
+def test_output_name_must_be_a_plain_name(project, name):
+    _write(project, [_scene("s1")])
+    with pytest.raises(sp.PipelineError):
+        sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name=name)
+
+
+def test_output_name_also_works_on_the_post_path(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.3}), _scene("s2", "two.wav", "b.png")],
+           bgm={"file": "music_long.wav", "volume": 0.3})
+    result = sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="alt")
+    assert Path(result["output"]).name == "alt.mp4" and (project / "out" / "alt.mp4").is_file()
+    assert not (project / "out" / "ep.mp4").exists()

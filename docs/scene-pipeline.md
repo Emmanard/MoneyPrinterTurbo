@@ -17,7 +17,7 @@ my-episode/
   audio/           pre-made narration (for example from Fish Audio) and music
   .scene_cache/    narration, clips and post stages (safe to delete)
   render/          renderer store: revisions and cached scene videos
-  out/             the finished video, out/<project_id>.mp4
+  out/             the finished video, out/<project_id>.mp4 (or out/<name>.mp4 with --output-name)
 ```
 
 ## Commands
@@ -25,12 +25,32 @@ my-episode/
 ```text
 python -m app.services.scene_pipeline --project my-episode validate
 python -m app.services.scene_pipeline --project my-episode plan
+python -m app.services.scene_pipeline --project my-episode plan --text
 python -m app.services.scene_pipeline --project my-episode build
+python -m app.services.scene_pipeline --project my-episode build --output-name take2 [--overwrite]
 python -m app.services.scene_pipeline --project my-episode status
 python -m app.services.scene_pipeline --project my-episode needs-network
 ```
 
 `validate` checks the manifest and probes every asset and the music file.
+`plan` is read-only and checks timing before you spend time rendering. For each scene
+it shows the narration length (after silence trimming), the scene length in frames and
+seconds, where it starts on the timeline, its transition, each asset's fit, motion,
+start, end and frames, each text card's window and how many seconds it ends before the
+scene does, and the caption cue count. It lists problems (cards that end after their
+scene, cards at the same position that overlap in time, asset durations that do not add
+up to the narration, transitions longer than their scenes, text that cannot fit) and
+warnings (a transition that overlaps speech), and exits with 1 if there are problems.
+The default output is JSON, one entry per scene; `--text` prints a readable report.
+Scenes whose narration is not generated yet show as pending, and everything that
+depends on their length is checked at build time instead.
+
+`build --output-name NAME` writes `out/NAME.mp4` instead of `out/<project_id>.mp4`, so a
+new build does not replace an earlier file. NAME is 1 to 64 letters, digits, `_` or `-`
+(no extension, no path). It refuses to replace an existing `out/NAME.mp4` unless
+`--overwrite` is given, and checks this before any narration is generated. Without
+`--output-name` the build replaces `out/<project_id>.mp4` as before.
+
 `needs-network` prints `yes` only if a scene still needs narration generated
 (Edge TTS needs the network); with pre-made audio or cached narration it prints
 `no`. Every problem in a manifest is reported together, and misuse is rejected
@@ -84,7 +104,7 @@ to anything other than null is an error.
 | `narration` | used | Text to speak; required unless `audio` is set. Also the caption text |
 | `audio` | used | Optional filename in `audio/`; skips TTS |
 | `asset` | used | Filename in `assets/` (image or video). Use this or `assets` |
-| `assets` | used | List of `{file, start, duration, motion}`; replaces `asset` |
+| `assets` | used | List of `{file, start, duration, motion, fit}`; replaces `asset` |
 | `motion` | used | `zoom_in` (default), `zoom_out`, `pan_left`, `pan_right`, `pan_up`, `pan_down`, `static`; images only |
 | `fit` | used | `cover` (default) fills the frame and crops; `contain_blur` shows the whole picture over a blurred copy of itself |
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
@@ -94,7 +114,9 @@ to anything other than null is an error.
 
 `assets[]` entries: `file` (filename in `assets/`), `start` (seconds into a video
 file where playing begins, default 0; not for images), `duration` (seconds on the
-scene timeline, optional), `motion` (optional, overrides the scene's `motion`).
+scene timeline, optional), `motion` (optional, overrides the scene's `motion`). `fit` (optional, `cover` or
+`contain_blur`; overrides the scene's `fit` for this entry only, so a portrait photo and a
+background plate can sit in one scene with different fits).
 
 ### Style objects
 

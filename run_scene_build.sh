@@ -3,8 +3,19 @@
 set -euo pipefail
 
 IMAGE="${SCENE_IMAGE:-moneyprinterturbo-scene:local}"
-PROJECT_ARG="${1:?usage: run_scene_build.sh <project-folder> [validate|plan|build|status]}"
+PROJECT_ARG="${1:?usage: run_scene_build.sh <project-folder> [validate|plan|build|status] [--text] [--output-name NAME] [--overwrite]}"
 COMMAND="${2:-build}"
+shift $(( $# < 2 ? $# : 2 ))
+# Only these flags are passed through to the pipeline.
+EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --text|--overwrite) EXTRA+=("$1") ;;
+    --output-name) [ $# -ge 2 ] || { echo "--output-name needs a value" >&2; exit 2; }; EXTRA+=("$1" "$2"); shift ;;
+    *) echo "unsupported option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 case "$COMMAND" in validate|plan|build|status) ;; *) echo "unsupported command: $COMMAND" >&2; exit 2 ;; esac
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -27,8 +38,9 @@ trap 'rm -rf "$WORK"' EXIT
 cp -R "$REPO/app" "$WORK/app"
 cp "$REPO/config.example.toml" "$WORK/config.toml"
 
-run() {  # run <network> <command>
-  docker run --rm --network "$1" --cap-drop ALL --security-opt no-new-privileges \
+run() {  # run <network> <command> [extra args]
+  local network="$1" command="$2"; shift 2
+  docker run --rm --network "$network" --cap-drop ALL --security-opt no-new-privileges \
     --user 1000:1000 --read-only --tmpfs /tmp:rw,size=512m \
     --tmpfs /MoneyPrinterTurbo/storage:rw,uid=1000,size=256m \
     --memory 2g --memory-swap 2g --cpus 2 --pids-limit 256 \
@@ -36,7 +48,7 @@ run() {  # run <network> <command>
     -v "$WORK/config.toml:/MoneyPrinterTurbo/config.toml:ro" \
     -v "$PROJECT:/project" -w /MoneyPrinterTurbo \
     -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
-    "$IMAGE" python -m app.services.scene_pipeline --project /project "$2"
+    "$IMAGE" python -m app.services.scene_pipeline --project /project "$command" ${@+"$@"}
 }
 
 NETWORK=none
@@ -52,7 +64,7 @@ if [ "$COMMAND" = "build" ]; then
     *) echo "unexpected needs-network answer: '$NEED'; stopping" >&2; exit 1 ;;
   esac
 fi
-run "$NETWORK" "$COMMAND"
+run "$NETWORK" "$COMMAND" ${EXTRA[@]+"${EXTRA[@]}"}
 
 LEFT="$(docker ps -a -q --filter "ancestor=$IMAGE")"
 [ -z "$LEFT" ] || echo "warning: containers still present: $LEFT" >&2

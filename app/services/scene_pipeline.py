@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,7 @@ class AssetRef:
     start: float = 0.0
     duration: float | None = None
     motion: str | None = None
+    fit: str | None = None  # None = use the scene's fit
 
 
 @dataclass(frozen=True)
@@ -419,7 +421,7 @@ def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> t
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("file", "start", "duration", "motion"):
+            if key not in ("file", "start", "duration", "motion", "fit"):
                 errors.append(f"{name}: unknown field: {key}")
         file = item.get("file")
         _plain_filename(file, f"{name}.file", IMAGE_EXTENSIONS | VIDEO_EXTENSIONS, folder, errors)
@@ -437,8 +439,12 @@ def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> t
         if motion is not None and motion not in MOTIONS:
             errors.append(f"{name}.motion: must be one of {', '.join(MOTIONS)}")
             motion = None
+        fit = item.get("fit")
+        if fit is not None and fit not in FITS:
+            errors.append(f"{name}.fit: must be one of {', '.join(FITS)}")
+            fit = None
         refs.append(AssetRef(file if isinstance(file, str) else "", float(start),
-                             None if duration is None else float(duration), motion))
+                             None if duration is None else float(duration), motion, fit))
     return tuple(refs)
 
 
@@ -742,10 +748,15 @@ def trim_trailing_silence(source: Path, output: Path, padding: float) -> None:
     )
 
 
-def ensure_trimmed_audio(project: Path, source: Path, padding: float) -> tuple[Path, float]:
+def trimmed_audio_path(project: Path, source: Path, padding: float) -> Path:
+    """Where the trimmed copy of ``source`` is (or will be) cached."""
     key = _key("trim-v1", _sha256_file(source), f"{padding:.4f}", TRIM_THRESHOLD_DB)
-    folder = project / ".scene_cache" / "audio"
-    final = folder / f"{key}.wav"
+    return project / ".scene_cache" / "audio" / f"{key}.wav"
+
+
+def ensure_trimmed_audio(project: Path, source: Path, padding: float) -> tuple[Path, float]:
+    final = trimmed_audio_path(project, source, padding)
+    folder = final.parent
     if not (final.is_file() and final.stat().st_size > 0):
         folder.mkdir(parents=True, exist_ok=True)
         descriptor, staged_name = tempfile.mkstemp(prefix=".trim-", suffix=".wav", dir=folder)
@@ -1088,7 +1099,7 @@ def ensure_scene_visual(project: Path, manifest: SceneManifest, scene: Scene,
             )
         clip, created = ensure_asset_clip(
             project, info, frames=count, start=ref.start, motion=ref.motion or scene.motion,
-            fit=scene.fit, settings=settings,
+            fit=ref.fit or scene.fit, settings=settings,
         )
         clips.append(clip)
         rendered += int(created)
@@ -1120,26 +1131,49 @@ def needs_network(project: Path) -> bool:
 
 
 def plan_report(project: Path) -> list[dict]:
-    manifest = load_manifest(project)
-    infos = inspect_media(manifest, project)
-    report = []
-    for scene in manifest.scenes:
-        source, path = audio_source(project, manifest, scene)
-        visual = "multi" if scene.assets else infos[scene.asset].kind
-        report.append({"scene": scene.id, "audio": source, "visual": visual,
-                       "audio_file": path.name})
-    return report
+    """One entry per scene: where its audio comes from (the original four keys) plus
+    its length, per-asset durations, card windows, caption cues, problems and
+    warnings. Read-only; see scene_plan."""
+    from app.services import scene_plan
+
+    return scene_plan.build_plan(project)["scenes"]
 
 
 def _say(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+OUTPUT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def check_output_name(name: str) -> str:
+    """A plain file name (no extension, no path) for out/<name>.mp4."""
+    if not isinstance(name, str) or not OUTPUT_NAME.fullmatch(name):
+        raise PipelineError(
+            "output name must be 1 to 64 letters, digits, underscores or hyphens, starting with "
+            f"a letter or digit (no extension, no path): {name!r}"
+        )
+    return name
+
+
 def build(project: Path, *, synthesize: Synthesizer | None = None,
-          progress: Callable[[str], None] = _say) -> dict:
-    """Prepare every scene, render through video_project, and publish out/<id>.mp4."""
+          progress: Callable[[str], None] = _say, output_name: str | None = None,
+          overwrite: bool = False) -> dict:
+    """Prepare every scene, render through video_project, and publish out/<name>.mp4.
+
+    ``name`` is the project id unless ``output_name`` is given. A custom name never
+    replaces an existing file unless ``overwrite`` is true; this is checked before any
+    narration is generated. The default name keeps replacing the previous build."""
     synthesize = synthesize or _synthesize
     manifest = load_manifest(project)
+    target_name = manifest.project_id
+    if output_name is not None:
+        target_name = check_output_name(output_name)
+        existing = project / "out" / f"{target_name}.mp4"
+        if existing.exists() and not overwrite:
+            raise PipelineError(
+                f"out/{target_name}.mp4 already exists; choose another --output-name or pass --overwrite"
+            )
     infos = inspect_media(manifest, project)
     scenes_request = []
     durations: list[float] = []
@@ -1200,15 +1234,16 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
         "stages": {key: value["reused"] for key, value in status["stages"].items()},
     }
     if post_stages:
-        post = scene_post.assemble(project, manifest, durations, status, progress)
+        post = scene_post.assemble(project, manifest, durations, status, progress,
+                                   output_name=target_name)
         result.update(output=post["output"], post_stages=post["stages"], frames=post["frames"],
                       seconds=post["seconds"], warnings=post["warnings"])
         return result
     exported = Path(status["export"]["path"])
     out_dir = project / "out"
     out_dir.mkdir(exist_ok=True)
-    final = out_dir / f"{manifest.project_id}.mp4"
-    staged = out_dir / f".{manifest.project_id}.partial.mp4"
+    final = out_dir / f"{target_name}.mp4"
+    staged = out_dir / f".{target_name}.partial.mp4"
     try:
         shutil.copyfile(exported, staged)
         os.replace(staged, final)
@@ -1225,8 +1260,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", required=True, help="Project folder containing scenes.json")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("validate", help="Check the manifest and probe every asset")
-    commands.add_parser("plan", help="Show where each scene's audio will come from")
-    commands.add_parser("build", help="Prepare scenes, render, and write out/<project_id>.mp4")
+    plan_parser = commands.add_parser(
+        "plan", help="Show scene lengths, asset durations, card windows and problems (read-only)")
+    plan_parser.add_argument("--text", action="store_true", help="Print a readable report instead of JSON")
+    build_parser = commands.add_parser("build", help="Prepare scenes, render, and write out/<name>.mp4")
+    build_parser.add_argument("--output-name", default=None, metavar="NAME",
+                              help="Write out/NAME.mp4 instead of out/<project_id>.mp4")
+    build_parser.add_argument("--overwrite", action="store_true",
+                              help="Allow --output-name to replace an existing file")
     commands.add_parser("status", help="Show the current render revision status")
     commands.add_parser("needs-network", help="Print yes if any scene still needs TTS, else no")
     args = parser.parse_args(argv)
@@ -1240,9 +1281,17 @@ def main(argv: list[str] | None = None) -> int:
             result = {"valid": True, "project_id": manifest.project_id,
                       "scenes": len(manifest.scenes)}
         elif args.command == "plan":
-            result = plan_report(project)
+            from app.services import scene_plan
+
+            plan = scene_plan.build_plan(project)
+            if args.text:
+                print(scene_plan.format_text(plan))
+            else:
+                print(json.dumps(plan["scenes"], indent=2))
+            # A plan with problems exits 1 so scripts can stop before a build.
+            return 1 if plan["summary"]["problems"] else 0
         elif args.command == "build":
-            result = build(project)
+            result = build(project, output_name=args.output_name, overwrite=args.overwrite)
         elif args.command == "needs-network":
             print("yes" if needs_network(project) else "no")
             return 0

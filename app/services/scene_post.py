@@ -405,9 +405,10 @@ def warnings_for(manifest: SceneManifest) -> list[str]:
 
 
 def assemble(project: Path, manifest: SceneManifest, durations: list[float], status: dict,
-             progress: Callable[[str], None]) -> dict:
+             progress: Callable[[str], None], output_name: str | None = None) -> dict:
     """Run every post stage on top of the renderer's scene artifacts and publish
-    out/<project_id>.mp4. Returns the output path and which stages were reused."""
+    out/<output_name or project_id>.mp4. Returns the output path and which stages
+    were reused."""
     settings = manifest.settings
     ctx = _Context(project, project / ".scene_cache" / "post", settings.fps, settings.width,
                    settings.height, progress)
@@ -449,8 +450,9 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
 
     out_dir = project / "out"
     out_dir.mkdir(exist_ok=True)
-    published = out_dir / f"{manifest.project_id}.mp4"
-    staged = out_dir / f".{manifest.project_id}.partial.mp4"
+    name = output_name or manifest.project_id
+    published = out_dir / f"{name}.mp4"
+    staged = out_dir / f".{name}.partial.mp4"
     try:
         shutil.copyfile(final, staged)
         os.replace(staged, published)
