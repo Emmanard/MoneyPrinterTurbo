@@ -1013,3 +1013,28 @@ def test_plan_shows_the_loudness_target(project, capsys):
     _loud(project, target=-16, peak=-1)
     assert sp.main(["--project", str(project), "plan", "--text"]) == 0
     assert "normalise to -16 LUFS, true peak -1 dBTP" in capsys.readouterr().out
+
+
+def test_loudnorm_gets_a_true_peak_target_below_the_requested_limit():
+    loudness = sp.Loudness(-14.0, -1.5)
+    assert scene_post.loudnorm_peak(loudness) == pytest.approx(-1.8)
+    assert scene_post._target_filter(loudness) == "I=-14:TP=-1.8:LRA=11"
+
+
+def test_linear_mode_needs_room_under_the_lowered_target():
+    loudness = sp.Loudness(-14.0, -1.5)
+    before = {"lufs": -20.0, "true_peak_db": -7.7, "lra": 3.0}
+    # +6 dB puts the peak at -1.7: under -1.5 but over the -1.8 handed to loudnorm
+    assert scene_post.loudnorm_mode(before, {"lufs": -14.0, "true_peak_db": -1.7, "lra": 3.0}, loudness) == "dynamic"
+
+
+def test_written_file_stays_under_the_requested_true_peak(project):
+    _loud(project, target=-16, peak=-3)
+    report = _build(project)["loudness"]
+    assert report["output"]["true_peak_db"] <= report["true_peak_db"] + 0.05
+
+
+def test_peak_headroom_never_asks_loudnorm_for_less_than_minus_nine():
+    assert scene_post.loudnorm_peak(sp.Loudness(-14.0, -9.0)) == -9.0
+    assert scene_post.loudnorm_peak(sp.Loudness(-14.0, -8.8)) == -9.0
+    assert scene_post.loudnorm_peak(sp.Loudness(-14.0, 0.0)) == pytest.approx(-0.3)

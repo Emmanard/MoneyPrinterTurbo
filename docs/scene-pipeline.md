@@ -299,6 +299,9 @@ rule 2).
 - Off unless `settings.loudness` is set. The normal output `out/<name>.mp4` is written as
   before; the normalised copy is written next to it as `out/<name>.loudnorm.mp4`, with the
   report in `out/<name>.loudnorm.json`. The video stream is copied, not re-encoded.
+- `true_peak_db` means the written file's true peak should not exceed it. loudnorm is given a
+  target 0.3 dB lower (for -1.5 it gets -1.8) to absorb the overshoot the AAC encode adds. loudnorm cannot go below -9, so a limit
+  between -9 and -8.7 gets less than 0.3 dB of headroom.
 - Two passes of ffmpeg `loudnorm` (LRA target 11) on the final mixed audio: the first
   measures it, the second applies a constant gain (`linear=true`) and encodes AAC 192k
   at 48 kHz. The result is measured again from the written file.
@@ -307,7 +310,8 @@ rule 2).
   `predicted_output` (loudnorm's own estimate before the AAC encode) and `ffmpeg_label`.
   `output` is measured from the file that was written.
 - `mode` is `linear` when one constant gain was applied, and `dynamic` when it was not.
-  Linear needs the gain that reaches the target to keep the true peak under the limit. If it
+  Linear needs the gain that reaches the target to keep the true peak under that lowered
+  target. If it
   would not, loudnorm falls back to dynamic processing, which can land well away from the
   target on short or steady audio. ffmpeg's own label says "linear" even in that case, so
   `mode` is decided from the measurements (peak headroom, and whether the output equals

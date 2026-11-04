@@ -382,10 +382,20 @@ def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, 
 
 # -- loudness -------------------------------------------------------------
 
-LOUDNESS_VERSION = "loud-v1"
+LOUDNESS_VERSION = "loud-v2"
 LOUDNESS_LRA = 11.0
 LOUDNESS_OFF_TARGET_LU = 1.0
 LOUDNESS_PEAK_SLACK_DB = 0.3
+# loudnorm is given a true-peak target this much below the requested limit, so the AAC
+# encode that follows (which can overshoot by a few tenths of a dB) stays under it.
+LOUDNESS_PEAK_HEADROOM_DB = 0.3
+LOUDNORM_MIN_TP = -9.0  # loudnorm refuses a TP target below this
+
+
+def loudnorm_peak(loudness) -> float:
+    """The true-peak target handed to loudnorm: the requested limit minus the headroom, but
+    never below the -9 dBTP that loudnorm accepts."""
+    return max(LOUDNORM_MIN_TP, loudness.true_peak_db - LOUDNESS_PEAK_HEADROOM_DB)
 
 
 def _loudnorm_json(text: str, what: str) -> dict:
@@ -426,7 +436,7 @@ def _loudnorm_run(arguments: list[str], cwd: Path, what: str) -> dict:
 
 
 def _target_filter(loudness) -> str:
-    return f"I={loudness.target_lufs:g}:TP={loudness.true_peak_db:g}:LRA={LOUDNESS_LRA:g}"
+    return f"I={loudness.target_lufs:g}:TP={loudnorm_peak(loudness):g}:LRA={LOUDNESS_LRA:g}"
 
 
 def measure_loudness(path: Path, loudness, cwd: Path, what: str) -> dict:
@@ -443,7 +453,7 @@ def measure_loudness(path: Path, loudness, cwd: Path, what: str) -> dict:
 
 def loudness_key(loudness, final_key: str, final_sha: str) -> str:
     return _key(LOUDNESS_VERSION, final_key, final_sha, loudness.target_lufs, loudness.true_peak_db,
-                LOUDNESS_LRA)
+                LOUDNESS_PEAK_HEADROOM_DB, LOUDNESS_LRA)
 
 
 LINEAR_GAIN_TOLERANCE_DB = 0.5
@@ -458,7 +468,7 @@ def loudnorm_mode(before: dict, after: dict, loudness) -> str:
     exactly that gain (input plus gain equals the measured output).
     """
     gain = loudness.target_lufs - before["lufs"]
-    if before["true_peak_db"] + gain > loudness.true_peak_db:
+    if before["true_peak_db"] + gain > loudnorm_peak(loudness):
         return "dynamic"
     if abs(after["lufs"] - (before["lufs"] + gain)) > LINEAR_GAIN_TOLERANCE_DB:
         return "dynamic"
