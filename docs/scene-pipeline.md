@@ -114,7 +114,7 @@ to anything other than null is an error.
 | `fit` | used | `cover` (default) fills the frame and crops; `contain_blur` shows the whole picture over a blurred copy of itself |
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
-| `text_cards` | used | List of `{text, style, start, end}`, up to 20 |
+| `text_cards` | used | List of `{text, style, start, end, kind, label}`, up to 20 (see Text card kinds) |
 | `transition` | used | `{type, duration}`; joins this scene to the next |
 
 `assets[]` entries: `file` (filename in `assets/`), `start` (seconds into a video
@@ -136,9 +136,15 @@ Used by `captions.style`, `text_cards[].style`, `settings.captions.style` and
 | `outline_width` | Pixels, 0 to 20; default about size / 14 |
 | `position` | `top`, `center` or `bottom`. Default `bottom` for captions, `center` for cards |
 | `box`, `box_opacity` | A translucent box behind the text. Off for captions, on for cards (opacity 0.55) |
+| `align` | Text cards only. `center` (default) or `left`. Left text starts at the left safe margin (or at the panel's padding) |
+| `panel`, `panel_color`, `panel_opacity` | Text cards only. One rectangle behind the whole card instead of a box per line. Off for plain cards, on for claim cards; colour default `#000000`, opacity 0.72 |
+| `accent_color` | Text cards only. `#RRGGBB`, default `#FFD400`. The label colour of claim cards. Set it in `settings.text_card_style` for a project default; a card's own `style.accent_color` overrides it |
 
 Defaults come from the code; a scene's style overrides the settings default,
 which overrides the code default.
+
+Captions reject the card-only keys (`align`, `panel`, `panel_color`, `panel_opacity`,
+`accent_color`).
 
 ## Examples
 
@@ -254,6 +260,32 @@ which overrides the code default.
   any `pause_after`). `end` must not be later than the scene's length; this is
   checked once the narration length is known, before rendering.
 - Multi-line cards are drawn as centered lines, one per wrapped line.
+
+### Text card kinds
+
+`kind` is `plain` (default, the cards described above) or `claim`. A plain card renders
+exactly as it did before the kinds existed, with the same cache keys, unless you set
+`align: "left"` or `panel: true` on it.
+
+A **claim card** is a small label over a larger claim, left aligned, on one panel:
+
+```json
+{"kind": "claim", "label": "TMZ", "text": "Fight with another inmate",
+ "start": 0.3, "end": 5.3, "style": {"position": "top"}}
+```
+
+- `label`: required, one line, 1 to 40 characters, shown in capitals at 55% of the claim
+  size in `accent_color`. `text`: the claim, 1 to 140 characters, wrapped and shrunk like any
+  card. `label` is rejected on other kinds.
+- Claim defaults: `align: left`, `panel: true`, no per-line boxes (these win over
+  `settings.text_card_style` for claim cards; the card's own `style` wins over them). The
+  panel hugs the text, starts at the left safe margin (centred if `align` is `center`),
+  and is padded by half the claim size sideways and 45% above and below.
+- The panel and the text always stay inside the safe margins. The size shrinks until the
+  whole block fits; a block that cannot fit at 10 px is rejected before rendering.
+- Readability over photos: the default panel is 72% black, and the text keeps its dark
+  outline. Lower `panel_opacity` only for plain backgrounds.
+- The card appears and disappears with a hard cut. `plan` lists the kind and label.
 
 ### Transitions and timing
 

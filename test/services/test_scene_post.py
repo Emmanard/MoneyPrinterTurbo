@@ -1254,3 +1254,100 @@ def test_music_record_says_where_the_seed_came_from(project):
     assert record["seed_source"] == "project_id"
     _named_project(project, "episode-7", {"folder": "music", "volume": 0.3, "seed": 4})
     assert _build(project)["music"]["seed_source"] == "manifest"
+
+
+# -- D1: claim card in real frames -------------------------------------------
+
+def _luma(image, box):
+    return sum(image.convert("L").crop(box).getdata()) / ((box[2] - box[0]) * (box[3] - box[1]))
+
+
+def _claim_scene(**card_style):
+    card = {"kind": "claim", "label": "Page Six", "text": "Hit his head on a bunk", "start": 0.2,
+            "end": 1.0, "style": {"position": "center", **card_style}}
+    return _scene("s1", audio="three.wav", motion="static", text_cards=[card])
+
+
+def _claim_style(manifest, card):
+    text = scene_post.scene_text
+    return text.resolve_style("card", 270, 480, manifest.text_card_style, text.KIND_DEFAULTS[card.kind],
+                              card.style)
+
+
+def _card_items(manifest):
+    card = manifest.scenes[0].text_cards[0]
+    return scene_post.scene_text.card_items(card, _claim_style(manifest, card), 270, 480)
+
+
+def _card_rect(project):
+    return next(i for i in _card_items(sp.load_manifest(project))
+                if isinstance(i, scene_post.scene_text.DrawBox))
+
+
+def test_claim_card_darkens_a_panel_only_while_it_is_shown(project):
+    _write(project, [_claim_scene()])
+    panel = _card_rect(project)
+    out = _build(project)["output"]
+    inside = Image.open(_frame(out, 0.6, project / "in.png"))
+    outside = Image.open(_frame(out, 1.2, project / "out.png"))
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+    assert _luma(inside, box) < 0.6 * _luma(outside, box)
+
+
+def test_claim_card_does_not_touch_the_side_margins(project):
+    _write(project, [_claim_scene(position="top")])
+    out = _build(project)["output"]
+    inside = Image.open(_frame(out, 0.6, project / "in.png")).convert("L")
+    outside = Image.open(_frame(out, 1.2, project / "out.png")).convert("L")
+    margin = round(scene_post.scene_text.MARGIN_X * 270)
+    for strip in ((0, 0, margin - 1, 480), (270 - margin + 1, 0, 270, 480)):
+        diff = sum(abs(a - b) for a, b in zip(inside.crop(strip).getdata(), outside.crop(strip).getdata()))
+        assert diff / ((strip[2] - strip[0]) * 480) < 3
+
+
+def test_claim_label_is_drawn_in_the_accent_colour(project):
+    _write(project, [_claim_scene(accent_color="#FF2020")])
+    panel = _card_rect(project)
+    inside = Image.open(_frame(_build(project)["output"], 0.6, project / "in.png")).convert("RGB")
+    crop = inside.crop((panel.x, panel.y, panel.x + panel.w, panel.y + panel.h))
+    reddish = [p for p in crop.getdata() if p[0] > 180 and p[1] < 90 and p[2] < 90]
+    assert len(reddish) >= 8
+
+
+def test_claim_card_is_gone_after_its_window(project):
+    _write(project, [_claim_scene()])
+    out = _build(project)["output"]
+    late = _frame(out, 1.2, project / "late.png")
+    _write(project, [_scene("s1", audio="three.wav", motion="static")])
+    bare = _frame(_build(project)["output"], 1.2, project / "bare.png")
+    assert _psnr(late, bare) > 35
+
+
+def test_plan_describes_a_claim_card(project, capsys):
+    _write(project, [_claim_scene()])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    text = capsys.readouterr().out
+    assert "claim" in text and "Page Six: Hit his head on a bunk" in text
+    assert sp.main(["--project", str(project), "plan"]) == 0
+    card = json.loads(capsys.readouterr().out)[0]["cards"][0]
+    assert card["kind"] == "claim" and card["label"] == "Page Six" and card["panel"] is True
+    assert card["align"] == "left" and card["inside_scene"] is True
+
+
+def test_claim_card_past_the_scene_end_is_rejected_before_rendering(project):
+    scene = _claim_scene()
+    scene["text_cards"][0]["end"] = 30
+    _write(project, [scene])
+    with pytest.raises(sp.PipelineError, match="text_cards"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_settings_accent_color_is_the_project_default(project):
+    manifest = {"schema_version": 1, "project_id": "ep", "scenes": [_claim_scene()],
+                "settings": {**SETTINGS, "text_card_style": {"accent_color": "#00AAFF"}}}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = sp.load_manifest(project)
+    assert loaded.text_card_style == {"accent_color": "#00AAFF"}
+    label = next(i for i in _card_items(loaded) if isinstance(i, scene_post.scene_text.DrawLine))
+    assert label.color == "#00AAFF"

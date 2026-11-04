@@ -24,7 +24,20 @@ MODE_WORDS = {"chunks": 3, "words": 1, "lines": 7}
 STYLE_KEYS = frozenset({
     "font", "size", "color", "outline_color", "outline_width", "position",
     "box", "box_color", "box_opacity",
+    "align", "panel", "panel_color", "panel_opacity", "accent_color",
 })
+# Keys that only text cards use; captions reject them.
+CARD_ONLY_KEYS = frozenset({"align", "panel", "panel_color", "panel_opacity", "accent_color"})
+ALIGNS = ("center", "left")
+CARD_KINDS = ("plain", "claim")
+MAX_CLAIM_LABEL = 40
+MAX_CLAIM_TEXT = 140
+DEFAULT_ACCENT = "#FFD400"
+# Defaults a card kind applies on top of settings.text_card_style (a card's own style wins).
+KIND_DEFAULTS = {
+    "plain": {},
+    "claim": {"align": "left", "panel": True, "box": False},
+}
 
 MAX_CUES_PER_SCENE = 400
 MAX_TEXT_CARDS = 20
@@ -58,6 +71,8 @@ class TextCard:
     style: dict
     start: float
     end: float
+    kind: str = "plain"
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +98,21 @@ class DrawLine:
     box_opacity: float
     start: float
     end: float
+    x: int | None = None  # left edge; None = centred
+
+
+@dataclass(frozen=True)
+class DrawBox:
+    """A filled rectangle (a panel behind a card) shown during [start, end)."""
+
+    x: int
+    y: int
+    w: int
+    h: int
+    color: str
+    opacity: float
+    start: float
+    end: float
 
 
 @dataclass(frozen=True)
@@ -102,7 +132,7 @@ def _is_number(value: object) -> bool:
 
 # -- validation -----------------------------------------------------------
 
-def parse_style(raw: object, label: str, errors: list[str]) -> dict:
+def parse_style(raw: object, label: str, errors: list[str], card: bool = True) -> dict:
     """Validate a style object; return only the keys that were given."""
     if raw is None:
         return {}
@@ -113,6 +143,8 @@ def parse_style(raw: object, label: str, errors: list[str]) -> dict:
     for key, value in raw.items():
         if key not in STYLE_KEYS:
             errors.append(f"{label}: unknown field: {key}")
+        elif key in CARD_ONLY_KEYS and not card:
+            errors.append(f"{label}.{key}: only text cards use this; captions do not")
         elif key == "font":
             if (
                 not isinstance(value, str)
@@ -128,7 +160,7 @@ def parse_style(raw: object, label: str, errors: list[str]) -> dict:
                 errors.append(f"{label}.size: must be a whole number from 8 to 400")
             else:
                 style[key] = value
-        elif key in ("color", "outline_color", "box_color"):
+        elif key in ("color", "outline_color", "box_color", "panel_color", "accent_color"):
             if not isinstance(value, str) or not _HEX.fullmatch(value):
                 errors.append(f"{label}.{key}: must be a color like #RRGGBB")
             else:
@@ -143,14 +175,19 @@ def parse_style(raw: object, label: str, errors: list[str]) -> dict:
                 errors.append(f"{label}.position: must be one of {', '.join(POSITIONS)}")
             else:
                 style[key] = value
-        elif key == "box":
+        elif key in ("box", "panel"):
             if not isinstance(value, bool):
-                errors.append(f"{label}.box: must be true or false")
+                errors.append(f"{label}.{key}: must be true or false")
             else:
                 style[key] = value
-        elif key == "box_opacity":
+        elif key == "align":
+            if value not in ALIGNS:
+                errors.append(f"{label}.align: must be one of {', '.join(ALIGNS)}")
+            else:
+                style[key] = value
+        elif key in ("box_opacity", "panel_opacity"):
             if not _is_number(value) or not 0 <= value <= 1:
-                errors.append(f"{label}.box_opacity: must be a number from 0 to 1")
+                errors.append(f"{label}.{key}: must be a number from 0 to 1")
             else:
                 style[key] = float(value)
     return style
@@ -176,7 +213,7 @@ def parse_caption_spec(raw: object, label: str, errors: list[str]) -> dict | Non
             else:
                 spec["mode"] = value
         elif key == "style":
-            spec["style"] = parse_style(value, f"{label}.style", errors)
+            spec["style"] = parse_style(value, f"{label}.style", errors, card=False)
         else:
             errors.append(f"{label}: unknown field: {key}")
     return spec
@@ -195,12 +232,26 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("text", "style", "start", "end"):
+            if key not in ("text", "style", "start", "end", "kind", "label"):
                 errors.append(f"{name}: unknown field: {key}")
+        kind = item.get("kind", "plain")
+        if kind not in CARD_KINDS:
+            errors.append(f"{name}.kind: must be one of {', '.join(CARD_KINDS)}")
+            kind = "plain"
+        limit = MAX_CLAIM_TEXT if kind == "claim" else MAX_CARD_TEXT
         text = item.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > MAX_CARD_TEXT:
-            errors.append(f"{name}.text: must be 1 to {MAX_CARD_TEXT} characters")
+        if not isinstance(text, str) or not text.strip() or len(text) > limit:
+            errors.append(f"{name}.text: must be 1 to {limit} characters")
             text = ""
+        label = item.get("label", "")
+        if kind == "claim":
+            if not isinstance(label, str) or not label.strip() or len(label) > MAX_CLAIM_LABEL or "\n" in label:
+                errors.append(f"{name}.label: a claim card needs a one-line label of 1 to {MAX_CLAIM_LABEL} characters")
+                label = ""
+            label = " ".join(label.split())
+        elif "label" in item:
+            errors.append(f"{name}.label: only used by claim cards")
+            label = ""
         style = parse_style(item.get("style"), f"{name}.style", errors)
         start, end = item.get("start"), item.get("end")
         if not _is_number(start) or start < 0:
@@ -209,7 +260,7 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
         if not _is_number(end) or end <= start:
             errors.append(f"{name}.end: must be a number of seconds after start")
             end = float(start) + 1.0
-        cards.append(TextCard(text, style, float(start), float(end)))
+        cards.append(TextCard(text, style, float(start), float(end), kind, label))
     return tuple(cards)
 
 
@@ -250,6 +301,11 @@ def resolve_style(kind: str, width: int, height: int, *layers: dict) -> dict:
         "box": not caption,
         "box_color": "#000000",
         "box_opacity": 0.55,
+        "align": "center",
+        "panel": False,
+        "panel_color": "#000000",
+        "panel_opacity": 0.72,
+        "accent_color": DEFAULT_ACCENT,
     }
     for layer in layers:
         style.update(layer or {})
@@ -410,6 +466,124 @@ def _draw_lines(text: str, style: dict, start: float, end: float, width: int,
     ]
 
 
+@dataclass(frozen=True)
+class Part:
+    """One run of lines in a text block: its text, size relative to the block's base size,
+    colour (None = the style colour) and whether it must stay on one line."""
+
+    text: str
+    scale: float = 1.0
+    color: str | None = None
+    single_line: bool = False
+
+
+@dataclass(frozen=True)
+class Block:
+    lines: list  # (text, size, color, y) in drawing order
+    x: int | None  # left edge of the text, None = centred
+    panel: tuple | None  # (x, y, w, h) or None
+
+
+PANEL_PAD_X = 0.5   # panel padding, as a fraction of the base size
+PANEL_PAD_Y = 0.45
+PART_GAP = 0.3      # space between parts, as a fraction of the base size
+
+
+def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Block:
+    """Lay out one or more parts as a block inside the safe area.
+
+    This is the shared text-block primitive: parts of different sizes and colours, left
+    or centred alignment, and an optional panel behind the whole block. The base size
+    shrinks until the block fits; the panel and the text never leave the safe margins
+    (6% on the sides, 8% at the top, 14% at the bottom of vertical video)."""
+    path = FONT_DIR / style["font"]
+    margin_x = round(MARGIN_X * width)
+    top = round(MARGIN_TOP * height)
+    bottom = round((MARGIN_BOTTOM_VERTICAL if height > width else MARGIN_BOTTOM_HORIZONTAL) * height)
+    outline = math.ceil(style["outline_width"])
+    panel = style["panel"]
+    left = style["align"] == "left"
+    base = style["size"]
+    while True:
+        if panel:
+            pad_x, pad_y = round(base * PANEL_PAD_X), round(base * PANEL_PAD_Y)
+        else:
+            pad_x = max(4, round(base * 0.25)) if style["box"] and left else 0
+            pad_y = 0
+        max_width = width - 2 * margin_x - 2 * pad_x - 2 * outline
+        gap = round(base * PART_GAP)
+        rows = []  # (text, size, color, line_height, spacing)
+        widest = 0.0
+        fits = True
+        for part in parts:
+            size = max(MIN_FONT_SIZE, round(base * part.scale))
+            font = _font(path, size)
+            wrapped = wrap_lines(part.text, font, max_width)
+            if not wrapped or (part.single_line and len(wrapped) != 1):
+                fits = False
+                break
+            ascent, descent = font.getmetrics()
+            for text in wrapped:
+                widest = max(widest, font.getlength(text))
+            rows.append((wrapped, size, part.color or style["color"], ascent + descent,
+                         round(size * 0.1)))
+        if fits:
+            block = sum(len(w) * h + max(0, len(w) - 1) * s for w, _, _, h, s in rows)
+            block += gap * (len(rows) - 1)
+            total = block + 2 * pad_y
+            if total <= height - top - bottom:
+                break
+        if base <= MIN_FONT_SIZE:
+            raise TextLayoutError(
+                f"text does not fit inside the safe area even at {MIN_FONT_SIZE}px: "
+                f"{parts[0].text[:40]!r}"
+            )
+        base = max(MIN_FONT_SIZE, int(base * 0.92))
+    if style["position"] == "top":
+        y0 = top
+    elif style["position"] == "center":
+        y0 = max(top, min((height - total) // 2, height - bottom - total))
+    else:
+        y0 = height - bottom - total
+    panel_width = min(width - 2 * margin_x, math.ceil(widest) + 2 * outline + 2 * pad_x)
+    panel_x = margin_x if left else (width - panel_width) // 2
+    lines = []
+    y = y0 + pad_y
+    for index, (wrapped, size, color, height_of_line, spacing) in enumerate(rows):
+        if index:
+            y += gap
+        for text in wrapped:
+            lines.append((text, size, color, y))
+            y += height_of_line + spacing
+        y -= spacing
+    x = panel_x + pad_x + outline if left else None
+    return Block(lines, x, (panel_x, y0, panel_width, total) if panel else None)
+
+
+def card_items(card: TextCard, style: dict, width: int, height: int) -> list:
+    """Overlay items (DrawBox and DrawLine) for one text card."""
+    plain = card.kind == "plain"
+    if plain and style["align"] == "center" and not style["panel"]:
+        # The original path, untouched: same lines, same keys, same output.
+        return _draw_lines(card.text, style, card.start, card.end, width, height)
+    if plain:
+        parts = [Part(card.text)]
+    else:
+        accent = style["accent_color"]
+        parts = [Part(card.label.upper(), 0.55, accent, single_line=True), Part(card.text)]
+    block = layout_parts(parts, style, width, height)
+    items: list = []
+    if block.panel is not None:
+        px, py, pw, ph = block.panel
+        items.append(DrawBox(px, py, pw, ph, style["panel_color"], style["panel_opacity"],
+                             card.start, card.end))
+    for text, size, color, y in block.lines:
+        items.append(DrawLine(text, style["font"], size, color, style["outline_color"],
+                              style["outline_width"], y, style["box"], style["box_color"],
+                              style["box_opacity"], card.start, card.end, block.x))
+    return items
+
+
 def scene_overlays(narration: str, audio_duration: float, caption: dict,
                    cards: tuple[TextCard, ...], card_defaults: dict, width: int,
                    height: int) -> list[DrawLine]:
@@ -421,8 +595,8 @@ def scene_overlays(narration: str, audio_duration: float, caption: dict,
             if cue.end > cue.start:
                 items.extend(_draw_lines(cue.text, style, cue.start, cue.end, width, height))
     for card in cards:
-        style = resolve_style("card", width, height, card_defaults, card.style)
-        items.extend(_draw_lines(card.text, style, card.start, card.end, width, height))
+        style = resolve_style("card", width, height, card_defaults, KIND_DEFAULTS[card.kind], card.style)
+        items.extend(card_items(card, style, width, height))
     return items
 
 
@@ -431,13 +605,23 @@ def overlay_key(items: list[DrawLine]) -> list:
     (name and size in bytes) so a replaced font invalidates the cache."""
     fonts = {}
     for item in items:
+        if not isinstance(item, DrawLine):
+            continue
         if item.font not in fonts:
             fonts[item.font] = (FONT_DIR / item.font).stat().st_size
-    return [
-        [[i.text, i.font, i.size, i.color, i.outline_color, i.outline_width, i.y, i.box,
-          i.box_color, i.box_opacity, i.start, i.end] for i in items],
-        sorted(fonts.items()),
-    ]
+    # Rows for original (centred, no panel) lines are unchanged, so caches made before the
+    # panel and alignment options still match; the new parts are only added when used.
+    rows = []
+    for i in items:
+        if isinstance(i, DrawBox):
+            rows.append(["panel", i.x, i.y, i.w, i.h, i.color, i.opacity, i.start, i.end])
+            continue
+        row = [i.text, i.font, i.size, i.color, i.outline_color, i.outline_width, i.y, i.box,
+               i.box_color, i.box_opacity, i.start, i.end]
+        if i.x is not None:
+            row.append(i.x)
+        rows.append(row)
+    return [rows, sorted(fonts.items())]
 
 
 # -- ffmpeg ---------------------------------------------------------------
@@ -455,6 +639,13 @@ def drawtext_chain(items: list[DrawLine], prefix: str) -> Chain:
     fonts: dict[str, Path] = {}
     aliases: dict[str, str] = {}
     for index, item in enumerate(items):
+        if isinstance(item, DrawBox):
+            filters.append(
+                f"drawbox=x={item.x}:y={item.y}:w={item.w}:h={item.h}:"
+                f"color={_ffmpeg_color(item.color)}@{item.opacity:g}:t=fill:"
+                f"enable='gte(t,{item.start:.3f})*lt(t,{item.end:.3f})'"
+            )
+            continue
         if item.font not in aliases:
             alias = f"{prefix}font{len(aliases)}{Path(item.font).suffix.lower()}"
             aliases[item.font] = alias
@@ -469,7 +660,7 @@ def drawtext_chain(items: list[DrawLine], prefix: str) -> Chain:
             f"fontcolor={_ffmpeg_color(item.color)}",
             f"borderw={item.outline_width:g}",
             f"bordercolor={_ffmpeg_color(item.outline_color)}",
-            "x=(w-text_w)/2",
+            "x=(w-text_w)/2" if item.x is None else f"x={item.x}",
             f"y={item.y}",
             f"enable='gte(t,{item.start:.3f})*lt(t,{item.end:.3f})'",
         ]

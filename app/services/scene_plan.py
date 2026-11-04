@@ -90,13 +90,18 @@ def _card_rows(manifest: sp.SceneManifest, scene: sp.Scene, length: float | None
     rows = []
     styles = []
     for index, card in enumerate(scene.text_cards, start=1):
-        style = scene_text.resolve_style("card", width, height, manifest.text_card_style, card.style)
+        style = scene_text.resolve_style("card", width, height, manifest.text_card_style,
+                                         scene_text.KIND_DEFAULTS[card.kind], card.style)
         styles.append(style)
-        row = {"index": index, "text": card.text, "position": style["position"],
+        row = {"index": index, "kind": card.kind, "text": card.text, "position": style["position"],
                "start": card.start, "end": card.end}
+        if card.kind == "claim":
+            row["label"] = card.label
         try:
-            lines, size, _ = scene_text.layout_block(card.text, style, width, height)
-            row.update(lines=len(lines), size=size,
+            drawn = [i for i in scene_text.card_items(card, style, width, height)
+                     if isinstance(i, scene_text.DrawLine)]
+            size = max(i.size for i in drawn)
+            row.update(lines=len(drawn), size=size, align=style["align"], panel=style["panel"],
                        shrunk_from=style["size"] if size < style["size"] else None)
         except scene_text.TextLayoutError as exc:
             problems.append(f"text card {index}: {exc}")
@@ -242,7 +247,11 @@ def format_text(plan: dict) -> str:
             detail = f"{c['position']}, {c.get('lines', '?')} line(s), size {c.get('size', '?')}"
             if c.get("shrunk_from"):
                 detail += f" (shrunk from {c['shrunk_from']})"
-            lines.append(f"  card {c['index']}: {window} [{detail}] {c['text'].splitlines()[0][:48]}")
+            shown = c["text"].splitlines()[0][:48]
+            if c.get("kind") == "claim":
+                shown = f"{c['label']}: {shown}"
+                detail += ", claim"
+            lines.append(f"  card {c['index']}: {window} [{detail}] {shown}")
         cap = e["captions"]
         if cap["enabled"]:
             cues = "pending" if cap["cues"] is None else cap["cues"]
