@@ -45,6 +45,8 @@ The default output is JSON, one entry per scene; `--text` prints a readable repo
 Scenes whose narration is not generated yet show as pending, and everything that
 depends on their length is checked at build time instead.
 
+`plan --summary` prints the project-level summary as JSON (totals, music pick, loudness).
+
 `build --output-name NAME` writes `out/NAME.mp4` instead of `out/<project_id>.mp4`, so a
 new build does not replace an earlier file. NAME is 1 to 64 letters, digits, `_` or `-`
 (no extension, no path). It refuses to replace an existing `out/NAME.mp4` unless
@@ -90,7 +92,9 @@ to anything other than null is an error.
 
 | Field | Status | Meaning |
 |---|---|---|
-| `file` | used | Filename in `audio/` |
+| `file` | used | Filename in `audio/`. Set this or `folder`, not both |
+| `folder` | used | Plain name of a folder inside `audio/`; one file is picked from it (see Music) |
+| `seed` | used | Whole number from 0; chooses the file from `folder`. Default: a stable hash of `project_id`, so each project picks differently. Not allowed with `file` |
 | `volume` | used | Above 0, up to 1; default 0.25 |
 | `ducking` | used | Omit for constant volume. `{}` turns ducking on with defaults |
 | `ducking.amount` | used | dB the music is lowered while narration plays, 0 to 18, default 12 |
@@ -288,6 +292,18 @@ rule 2).
 - The music file comes from `audio/`. It is looped or trimmed to the video length
   and mixed under the narration at `volume`. It ends together with the video; no
   fade is added.
+- `bgm.folder` picks one track instead of naming it. The candidates are the audio files
+  directly inside `audio/<folder>/`, sorted by name (hidden files and other extensions are
+  ignored; no sub-folders). When `seed` is not given it is derived from `project_id` (SHA-256 of the id, the same on every
+  machine); an explicit `seed` overrides that. The seed selects one by a SHA-256 hash of the seed and the file
+  count, so the same seed, names and count give the same file on any machine. Nothing
+  outside that folder can be chosen: the folder must be a plain name (no path), the folder
+  and its files must not be symbolic links, and an empty folder is an error.
+- The pick is recorded in the `plan` report (`plan --text` shows it, `plan --summary` gives
+  JSON), in the build result under `music`, and in `out/<name>.music.json` with the folder,
+  seed, `seed_source` (`manifest` or `project_id`), candidate count, chosen filename and path. Rebuilding with the same seed and the same
+  folder contents picks the same file and reuses every stage. Adding or removing files
+  changes the count and can change the pick; to keep a track, name it with `bgm.file`.
 - Ducking lowers the music while narration plays, using a sidechain compressor
   keyed by the narration. `amount` is the approximate reduction in dB for
   narration at about -20 dBFS (typical for generated speech); louder narration
@@ -330,7 +346,7 @@ text, style, frame counts, settings), so a change rebuilds only what depends on 
 | A caption, text card or `pause_after` of scene X | X's picture, the junctions touching X, the picture join, the final mix |
 | A scene's narration or audio | X's renderer stages, X's picture and narration segments, its junctions, both joins, the final mix |
 | A transition between X and Y | the junction (and the neighbouring bodies' cut points), both joins, the final mix |
-| `bgm` settings or file | the final mix only |
+| `bgm` settings, file, or the file the seed picks | the final mix only |
 | `settings.loudness` | the loudness stage only (the final mix is reused) |
 | Another scene's anything | nothing of X's |
 

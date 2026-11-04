@@ -3,14 +3,14 @@
 set -euo pipefail
 
 IMAGE="${SCENE_IMAGE:-moneyprinterturbo-scene:local}"
-PROJECT_ARG="${1:?usage: run_scene_build.sh <project-folder> [validate|plan|build|status] [--text] [--output-name NAME] [--overwrite]}"
+PROJECT_ARG="${1:?usage: run_scene_build.sh <project-folder> [validate|plan|build|status] [--text] [--summary] [--output-name NAME] [--overwrite]}"
 COMMAND="${2:-build}"
 shift $(( $# < 2 ? $# : 2 ))
 # Only these flags are passed through to the pipeline.
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --text|--overwrite) EXTRA+=("$1") ;;
+    --text|--summary|--overwrite) EXTRA+=("$1") ;;
     --output-name) [ $# -ge 2 ] || { echo "--output-name needs a value" >&2; exit 2; }; EXTRA+=("$1" "$2"); shift ;;
     *) echo "unsupported option: $1" >&2; exit 2 ;;
   esac

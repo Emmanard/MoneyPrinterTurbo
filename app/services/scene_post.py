@@ -506,6 +506,14 @@ def _normalise(final: Path, loudness, work: Path, staged: Path, seconds: float) 
     }
 
 
+def music_record(bgm) -> dict:
+    """What was picked from a bgm folder, so a later build can be checked against it."""
+    return {"folder": bgm.folder, "seed": bgm.seed,
+            "seed_source": "manifest" if bgm.seed_explicit else "project_id",
+            "candidates": bgm.candidates,
+            "chosen": bgm.chosen, "file": bgm.file}
+
+
 def loudness_warnings(report: dict) -> list[str]:
     warnings = []
     out = report["output"]
@@ -636,6 +644,17 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
         "seconds": count / settings.fps,
         "warnings": warnings,
     }
+    bgm = manifest.bgm
+    if bgm is not None and bgm.folder:
+        record = music_record(bgm)
+        music_path = out_dir / f"{name}.music.json"
+        part = out_dir / f".{name}.music.partial.json"
+        try:
+            part.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            os.replace(part, music_path)
+        finally:
+            part.unlink(missing_ok=True)
+        result["music"] = {**record, "record": str(music_path)}
     if report is not None:
         loud_media = out_dir / f"{name}.loudnorm.mp4"
         loud_report = out_dir / f"{name}.loudnorm.json"

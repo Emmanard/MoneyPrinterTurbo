@@ -1038,3 +1038,219 @@ def test_peak_headroom_never_asks_loudnorm_for_less_than_minus_nine():
     assert scene_post.loudnorm_peak(sp.Loudness(-14.0, -9.0)) == -9.0
     assert scene_post.loudnorm_peak(sp.Loudness(-14.0, -8.8)) == -9.0
     assert scene_post.loudnorm_peak(sp.Loudness(-14.0, 0.0)) == pytest.approx(-0.3)
+
+
+# -- stage C: random music from a folder -------------------------------------
+
+def _music_folder(root, names=("c_calm.wav", "a_bright.wav", "b_mellow.wav", "d_low.wav"), folder="music"):
+    (root / "audio" / folder).mkdir(parents=True, exist_ok=True)
+    for index, name in enumerate(names):  # created out of order on purpose
+        _tone(root / "audio" / folder / name, 3, 400 + 150 * index, 4)
+    return root / "audio" / folder
+
+
+def _bgm_manifest(root, bgm, scenes=None):
+    scenes = scenes or [_scene("s1"), _scene("s2", "two.wav", "b.png")]
+    _write(root, scenes, bgm=bgm)
+
+
+def _chosen(root):
+    return sp.load_manifest(root).bgm.chosen
+
+
+@pytest.mark.parametrize("bgm,message", [
+    ({"file": "music_long.wav", "folder": "music"}, "bgm: set either file or folder, not both"),
+    ({"volume": 0.3}, "bgm: set file (one track) or folder (pick one at random)"),
+    ({"file": "music_long.wav", "seed": 3}, "bgm.seed: only used with bgm.folder"),
+    ({"folder": "music", "seed": -1}, "bgm.seed: must be a whole number from 0 up"),
+    ({"folder": "music", "seed": 1.5}, "bgm.seed: must be a whole number from 0 up"),
+    ({"folder": "music", "seed": True}, "bgm.seed: must be a whole number from 0 up"),
+    ({"folder": "music", "seed": "7"}, "bgm.seed: must be a whole number from 0 up"),
+    ({"folder": "../music"}, "bgm.folder: must be a plain folder name"),
+    ({"folder": "a/b"}, "bgm.folder: must be a plain folder name"),
+    ({"folder": ".hidden"}, "bgm.folder: must be a plain folder name"),
+    ({"folder": ""}, "bgm.folder: must be a plain folder name"),
+    ({"folder": 3}, "bgm.folder: must be a plain folder name"),
+    ({"folder": "nothere"}, "bgm.folder: 'nothere' is not a folder in audio/"),
+])
+def test_music_folder_setting_is_validated(project, bgm, message):
+    _music_folder(project)
+    _bgm_manifest(project, bgm)
+    assert message in _errors(project)
+
+
+def test_music_folder_without_audio_files_is_rejected(project):
+    folder = _music_folder(project, names=())
+    (folder / "notes.txt").write_text("not music")
+    (folder / ".hidden.wav").write_bytes(b"")
+    _bgm_manifest(project, {"folder": "music"})
+    assert "no audio files in audio/music/" in _errors(project)
+
+
+def test_a_file_must_be_directly_inside_the_folder(project):
+    folder = _music_folder(project, names=())
+    (folder / "nested").mkdir()
+    _tone(folder / "nested" / "deep.wav", 2)
+    _bgm_manifest(project, {"folder": "music"})
+    assert "no audio files in audio/music/" in _errors(project)
+
+
+def test_nothing_is_picked_from_outside_the_folder(project, tmp_path):
+    folder = _music_folder(project)
+    outside = tmp_path / "elsewhere.wav"
+    _tone(outside, 2)
+    (folder / "zz_link.wav").symlink_to(outside)
+    _bgm_manifest(project, {"folder": "music"})
+    assert "symbolic links are not allowed: music/zz_link.wav" in _errors(project)
+    (folder / "zz_link.wav").unlink()
+    (project / "audio" / "linked").symlink_to(folder)
+    _bgm_manifest(project, {"folder": "linked"})
+    assert "bgm.folder: symbolic links are not allowed" in _errors(project)
+
+
+def test_top_level_audio_files_are_never_candidates(project):
+    folder = _music_folder(project, names=("only.wav",))
+    for seed in range(8):
+        _bgm_manifest(project, {"folder": "music", "seed": seed})
+        bgm = sp.load_manifest(project).bgm
+        assert bgm.file == "music/only.wav" and bgm.candidates == 1
+    assert folder.parent.joinpath("music_long.wav").is_file()
+
+
+def test_the_same_seed_picks_the_same_file_whatever_the_creation_order(project):
+    _music_folder(project)
+    _bgm_manifest(project, {"folder": "music", "seed": 5})
+    first = _chosen(project)
+    shutil.rmtree(project / "audio" / "music")
+    _music_folder(project, names=("d_low.wav", "b_mellow.wav", "a_bright.wav", "c_calm.wav"))
+    # the tones differ by name now, but the choice depends only on seed and sorted names
+    assert _chosen(project) == first
+    names = sorted(p.name for p in (project / "audio" / "music").iterdir())
+    assert first == names[sp.music_index(5, 4)]
+
+
+def test_different_seeds_reach_different_files_and_stay_in_range(project):
+    _music_folder(project)
+    seen = set()
+    for seed in range(30):
+        index = sp.music_index(seed, 4)
+        assert 0 <= index < 4 and index == sp.music_index(seed, 4)
+        seen.add(index)
+    assert len(seen) >= 3
+
+
+def test_build_records_the_pick_in_the_result_and_next_to_the_output(project):
+    _music_folder(project)
+    _bgm_manifest(project, {"folder": "music", "seed": 11, "volume": 0.3})
+    result = _build(project)
+    music = result["music"]
+    assert music["folder"] == "music" and music["seed"] == 11 and music["candidates"] == 4
+    assert music["chosen"] == _chosen(project) and music["file"] == f"music/{music['chosen']}"
+    record = json.loads((project / "out" / "ep.music.json").read_text())
+    assert record == {k: v for k, v in music.items() if k != "record"}
+    assert Path(music["record"]) == project / "out" / "ep.music.json"
+
+
+def test_rebuild_with_the_same_seed_is_repeatable_and_reuses_every_stage(project):
+    _music_folder(project)
+    _bgm_manifest(project, {"folder": "music", "seed": 2, "volume": 0.3})
+    first = _build(project)
+    again = _build(project)
+    assert again["music"] == first["music"] and _rebuilt(again) == set()
+
+
+def test_a_different_pick_rebuilds_only_the_final_mix(project):
+    _music_folder(project)
+    one = next(s for s in range(50) if sp.music_index(s, 4) == 0)
+    two = next(s for s in range(50) if sp.music_index(s, 4) == 2)
+    _bgm_manifest(project, {"folder": "music", "seed": one, "volume": 0.3})
+    first = _build(project)
+    _bgm_manifest(project, {"folder": "music", "seed": two, "volume": 0.3})
+    second = _build(project)
+    assert first["music"]["chosen"] != second["music"]["chosen"]
+    assert _rebuilt(second) == {"final"}
+
+
+def test_single_file_music_has_no_pick_record(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "volume": 0.3})
+    result = _build(project)
+    assert "music" not in result and not list((project / "out").glob("*.music.json"))
+
+
+def test_plan_shows_which_file_the_seed_picked(project, capsys):
+    _music_folder(project)
+    _bgm_manifest(project, {"folder": "music", "seed": 9})
+    chosen = _chosen(project)
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    assert f"music: {chosen} picked from audio/music/ with seed 9 (from manifest), 4 files" in capsys.readouterr().out
+    assert sp.main(["--project", str(project), "plan", "--summary"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["music"] == {"folder": "music", "seed": 9, "seed_source": "manifest",
+                               "candidates": 4, "chosen": chosen}
+    assert capsys.readouterr().out == ""
+
+
+def test_music_record_is_not_replaced_by_a_named_build_without_overwrite(project):
+    _music_folder(project)
+    _bgm_manifest(project, {"folder": "music", "seed": 1, "volume": 0.3})
+    sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take4")
+    (project / "out" / "take4.mp4").unlink()
+    with pytest.raises(sp.PipelineError, match="take4.music.json already exists"):
+        sp.build(project, synthesize=_forbidden, progress=lambda _m: None, output_name="take4")
+
+
+def test_loudness_line_appears_once_in_the_text_plan(project, capsys):
+    _loud(project, target=-16, peak=-1)
+    sp.main(["--project", str(project), "plan", "--text"])
+    assert capsys.readouterr().out.count("loudness: normalise to") == 1
+
+
+def _named_project(root, project_id, bgm):
+    scenes = [_scene("s1")]
+    manifest = {"schema_version": 1, "project_id": project_id, "settings": dict(SETTINGS),
+                "scenes": scenes, "bgm": bgm}
+    (root / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_default_seed_comes_from_the_project_id(project):
+    import hashlib
+
+    _music_folder(project)
+    expected = int.from_bytes(hashlib.sha256(b"scene-music-seed-v1:episode-7").digest()[:8], "big") % 2**63
+    assert sp.default_music_seed("episode-7") == expected
+    assert sp.default_music_seed("episode-7") == sp.default_music_seed("episode-7")
+    _named_project(project, "episode-7", {"folder": "music"})
+    bgm = sp.load_manifest(project).bgm
+    assert bgm.seed == expected and bgm.seed_explicit is False
+    names = sorted(p.name for p in (project / "audio" / "music").iterdir())
+    assert bgm.chosen == names[sp.music_index(expected, 4)]
+
+
+def test_different_projects_pick_differently_by_default(project):
+    _music_folder(project)
+    picks = set()
+    for number in range(12):
+        _named_project(project, f"show-{number}", {"folder": "music"})
+        picks.add(_chosen(project))
+    assert len(picks) >= 3
+
+
+def test_an_explicit_seed_overrides_the_project_id_default(project):
+    _music_folder(project)
+    _named_project(project, "episode-7", {"folder": "music", "seed": 0})
+    bgm = sp.load_manifest(project).bgm
+    assert bgm.seed == 0 and bgm.seed_explicit is True
+    _named_project(project, "other-name", {"folder": "music", "seed": 0})
+    assert _chosen(project) == bgm.chosen
+
+
+def test_music_record_says_where_the_seed_came_from(project):
+    _music_folder(project)
+    _named_project(project, "episode-7", {"folder": "music", "volume": 0.3})
+    result = _build(project)
+    assert result["music"]["seed_source"] == "project_id"
+    assert result["music"]["seed"] == sp.default_music_seed("episode-7")
+    record = json.loads((project / "out" / "episode-7.music.json").read_text())
+    assert record["seed_source"] == "project_id"
+    _named_project(project, "episode-7", {"folder": "music", "volume": 0.3, "seed": 4})
+    assert _build(project)["music"]["seed_source"] == "manifest"

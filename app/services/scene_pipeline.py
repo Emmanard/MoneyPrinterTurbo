@@ -159,6 +159,16 @@ class Bgm:
     file: str
     volume: float
     ducking: Ducking | None
+    # Set only when the file was picked from a folder in audio/: the folder name, the
+    # seed, and how many files were in the folder. ``file`` is then "<folder>/<chosen>".
+    folder: str | None = None
+    seed: int | None = None
+    candidates: int | None = None
+    seed_explicit: bool = True
+
+    @property
+    def chosen(self) -> str:
+        return self.file.rsplit("/", 1)[-1]
 
 
 @dataclass(frozen=True)
@@ -322,7 +332,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
                 else:
                     voice_rate = float(rate)
 
-    bgm = _parse_bgm(raw.get("bgm"), project / "audio", errors)
+    bgm = _parse_bgm(raw.get("bgm"), project / "audio", errors, project_id)
 
     scenes: list[Scene] = []
     scenes_raw = raw.get("scenes")
@@ -513,17 +523,95 @@ def _parse_loudness(raw: object, errors: list[str]) -> Loudness | None:
     return Loudness(float(target), float(peak)) if ok else None
 
 
-def _parse_bgm(raw: object, folder: Path, errors: list[str]) -> Bgm | None:
+MAX_MUSIC_FOLDER_FILES = 1000
+MAX_SEED = 2**63 - 1
+
+
+def music_index(seed: int, count: int) -> int:
+    """Which of ``count`` sorted files a seed picks. Uses a hash, not the random module,
+    so the same seed and file count always give the same index on any Python version."""
+    digest = hashlib.sha256(f"scene-music-pick-v1:{seed}:{count}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+def default_music_seed(project_id: str) -> int:
+    """The seed used when bgm.seed is not given: a stable hash of the project id, so every
+    project picks differently but the same project picks the same file on every machine."""
+    digest = hashlib.sha256(f"scene-music-seed-v1:{project_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (MAX_SEED + 1)
+
+
+def _pick_music(name: object, seed: object, audio_dir: Path, errors: list[str],
+                explicit: bool = True) -> tuple[str, dict]:
+    """Pick one audio file from audio/<name>/ with a seed. Returns ("<name>/<file>", fields).
+
+    Only a plain folder name directly inside audio/ is accepted, the folder must be a real
+    directory, and the choice is made from the sorted names of the regular files directly
+    inside it, so nothing can be chosen from outside that folder."""
+    if not _is_number(seed) or isinstance(seed, bool) or int(seed) != seed or not 0 <= seed <= MAX_SEED:
+        errors.append("bgm.seed: must be a whole number from 0 up")
+        return "", {}
+    if (
+        not isinstance(name, str) or not name or name != os.path.basename(name)
+        or "\\" in name or "\x00" in name or name.startswith(".") or len(name) > 255
+    ):
+        errors.append(f"bgm.folder: must be a plain folder name inside audio/, not a path: {name!r}")
+        return "", {}
+    folder = audio_dir / name
+    if folder.is_symlink():
+        errors.append(f"bgm.folder: symbolic links are not allowed: {name!r}")
+        return "", {}
+    if not folder.is_dir():
+        errors.append(f"bgm.folder: {name!r} is not a folder in {audio_dir.name}/")
+        return "", {}
+    candidates = []
+    for entry in sorted(os.listdir(folder)):
+        if entry.startswith(".") or Path(entry).suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        path = folder / entry
+        if path.is_symlink():
+            errors.append(f"bgm.folder: symbolic links are not allowed: {name}/{entry}")
+            return "", {}
+        if path.is_file():
+            candidates.append(entry)
+    if not candidates:
+        errors.append(
+            f"bgm.folder: no audio files in {audio_dir.name}/{name}/ "
+            f"(allowed: {', '.join(sorted(AUDIO_EXTENSIONS))})"
+        )
+        return "", {}
+    if len(candidates) > MAX_MUSIC_FOLDER_FILES:
+        errors.append(f"bgm.folder: {len(candidates)} files; the limit is {MAX_MUSIC_FOLDER_FILES}")
+        return "", {}
+    chosen = candidates[music_index(int(seed), len(candidates))]
+    return f"{name}/{chosen}", {"folder": name, "seed": int(seed), "seed_explicit": explicit,
+                                     "candidates": len(candidates)}
+
+
+def _parse_bgm(raw: object, folder: Path, errors: list[str], project_id: str = "") -> Bgm | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        errors.append("bgm: must be an object like {file, volume, ducking}")
+        errors.append("bgm: must be an object like {file or folder, seed, volume, ducking}")
         return None
     for key in raw:
-        if key not in ("file", "volume", "ducking"):
+        if key not in ("file", "folder", "seed", "volume", "ducking"):
             errors.append(f"bgm: unknown field: {key}")
     file = raw.get("file")
-    _plain_filename(file, "bgm.file", AUDIO_EXTENSIONS, folder, errors)
+    pick: dict = {}
+    if "file" in raw and "folder" in raw:
+        errors.append("bgm: set either file or folder, not both")
+    elif "folder" in raw:
+        file, pick = _pick_music(
+            raw.get("folder"), raw["seed"] if "seed" in raw else default_music_seed(project_id),
+            folder, errors, explicit="seed" in raw)
+    else:
+        if "seed" in raw:
+            errors.append("bgm.seed: only used with bgm.folder")
+        if "file" not in raw:
+            errors.append("bgm: set file (one track) or folder (pick one at random)")
+        else:
+            _plain_filename(file, "bgm.file", AUDIO_EXTENSIONS, folder, errors)
     volume = raw.get("volume", DEFAULT_BGM_VOLUME)
     if not _is_number(volume) or not 0 < volume <= 1:
         errors.append("bgm.volume: must be a number above 0 and at most 1")
@@ -550,7 +638,7 @@ def _parse_bgm(raw: object, folder: Path, errors: list[str]) -> Bgm | None:
                 errors.append("bgm.ducking.release: must be a number of milliseconds from 10 to 9000")
                 release = DEFAULT_DUCK_RELEASE_MS
             ducking = Ducking(float(amount), float(attack), float(release))
-    return Bgm(file if isinstance(file, str) else "", float(volume), ducking)
+    return Bgm(file if isinstance(file, str) else "", float(volume), ducking, **pick)
 
 
 def load_manifest(project: Path) -> SceneManifest:
@@ -1208,6 +1296,11 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
             raise PipelineError(
                 f"out/{target_name}.mp4 already exists; choose another --output-name or pass --overwrite"
             )
+        music_record = project / "out" / f"{target_name}.music.json"
+        if manifest.bgm is not None and manifest.bgm.folder and music_record.exists() and not overwrite:
+            raise PipelineError(
+                f"out/{target_name}.music.json already exists; choose another --output-name or pass --overwrite"
+            )
         loud = project / "out" / f"{target_name}.loudnorm.mp4"
         if manifest.loudness is not None and loud.exists() and not overwrite:
             raise PipelineError(
@@ -1279,6 +1372,8 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
                       seconds=post["seconds"], warnings=post["warnings"])
         if "loudness" in post:
             result["loudness"] = post["loudness"]
+        if "music" in post:
+            result["music"] = post["music"]
         return result
     exported = Path(status["export"]["path"])
     out_dir = project / "out"
@@ -1304,6 +1399,8 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser = commands.add_parser(
         "plan", help="Show scene lengths, asset durations, card windows and problems (read-only)")
     plan_parser.add_argument("--text", action="store_true", help="Print a readable report instead of JSON")
+    plan_parser.add_argument("--summary", action="store_true",
+                             help="Print the project-level summary (totals, music pick, loudness) as JSON")
     build_parser = commands.add_parser("build", help="Prepare scenes, render, and write out/<name>.mp4")
     build_parser.add_argument("--output-name", default=None, metavar="NAME",
                               help="Write out/NAME.mp4 instead of out/<project_id>.mp4")
@@ -1327,6 +1424,8 @@ def main(argv: list[str] | None = None) -> int:
             plan = scene_plan.build_plan(project)
             if args.text:
                 print(scene_plan.format_text(plan))
+            elif args.summary:
+                print(json.dumps(plan["summary"], indent=2))
             else:
                 print(json.dumps(plan["scenes"], indent=2))
             # A plan with problems exits 1 so scripts can stop before a build.

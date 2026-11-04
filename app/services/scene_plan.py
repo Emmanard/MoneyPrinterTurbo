@@ -193,6 +193,10 @@ def build_plan(project: Path) -> dict:
         "total_frames": sum(known) - sum(tails) if all_known else None,
         "total_seconds": _round((sum(known) - sum(tails)) / fps) if all_known else None,
         "transition_frames": sum(tails),
+        "music": None if manifest.bgm is None or not manifest.bgm.folder else {
+            "folder": manifest.bgm.folder, "seed": manifest.bgm.seed,
+            "seed_source": "manifest" if manifest.bgm.seed_explicit else "project_id",
+            "candidates": manifest.bgm.candidates, "chosen": manifest.bgm.chosen},
         "loudness": None if manifest.loudness is None else (
             f"{manifest.loudness.target_lufs:g} LUFS, true peak {manifest.loudness.true_peak_db:g} dBTP"),
         "loudness": None if manifest.loudness is None else
@@ -250,8 +254,11 @@ def format_text(plan: dict) -> str:
         for text in e["problems"]:
             lines.append(f"  PROBLEM: {text}")
     lines.append("")
-    if summary.get("loudness"):
-        lines.append(f"loudness: normalise to {summary['loudness']} (second file out/<name>.loudnorm.mp4, report .loudnorm.json)")
+    if summary["music"]:
+        music = summary["music"]
+        lines.append(f"music: {music['chosen']} picked from audio/{music['folder']}/ with seed "
+                     f"{music['seed']} (from {music['seed_source']}), {music['candidates']} files; "
+                     "recorded in out/<name>.music.json")
     if summary["loudness"]:
         lines.append(f"loudness: normalise to {summary['loudness']} "
                      "(written as out/<name>.loudnorm.mp4 and out/<name>.loudnorm.json)")
