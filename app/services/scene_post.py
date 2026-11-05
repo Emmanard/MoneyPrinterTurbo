@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from app.services import scene_text
+from app.services import scene_look, scene_text
 from app.services.scene_pipeline import (
     PipelineError,
     SceneManifest,
@@ -112,6 +112,7 @@ class _Scene:
     lines: list
     lines_key: list
     volume_db: float = 0.0
+    look: str = ""  # ffmpeg filters for the scene's grade and vignette, "" for none
 
 
 @dataclass
@@ -257,6 +258,8 @@ def _scene_chain(ctx: _Context, scene: _Scene, work: Path, prefix: str, first: i
         f"trim=end_frame={scene.frames}",
         f"setpts=N/({fps}*TB)",
     ]
+    if scene.look:
+        parts.append(scene.look)  # grade and vignette sit under the text, over the picture
     chain = scene_text.drawtext_chain(scene.lines, prefix)
     if chain.filters:
         parts.append(chain.filters)
@@ -276,7 +279,8 @@ def _video_body(ctx: _Context, scene: _Scene) -> Path | None:
     if length <= 0:
         return None
     key = _key(SEGMENT_VERSION, "body", scene.video_sha, scene.lines_key, scene.frames,
-               scene.head, scene.tail, ctx.fps, ctx.width, ctx.height, ENCODE)
+               scene.head, scene.tail, ctx.fps, ctx.width, ctx.height, ENCODE,
+               *([scene.look] if scene.look else []))
 
     def build(work: Path, staged: Path) -> None:
         chain = _scene_chain(ctx, scene, work, "t", scene.head, scene.frames - scene.tail, False)
@@ -290,11 +294,14 @@ def _video_body(ctx: _Context, scene: _Scene) -> Path | None:
     return _ensure(ctx, "vseg", key, ".mp4", f"{scene.id}:picture", build)
 
 
-def _video_junction(ctx: _Context, first: _Scene, second: _Scene, kind: str) -> Path:
+def _video_junction(ctx: _Context, first: _Scene, second: _Scene, kind: str,
+                    flash: dict | None = None) -> Path:
     shared = first.tail
     key = _key(SEGMENT_VERSION, "junction", first.video_sha, first.lines_key, first.frames,
                second.video_sha, second.lines_key, second.frames, shared, kind, ctx.fps,
-               ctx.width, ctx.height, ENCODE)
+               ctx.width, ctx.height, ENCODE,
+               *([first.look, second.look] if first.look or second.look else []),
+               *([scene_look.flash_key(flash)] if flash else []))
 
     def build(work: Path, staged: Path) -> None:
         a = _scene_chain(ctx, first, work, "a", first.frames - shared, first.frames, True)
@@ -303,10 +310,14 @@ def _video_junction(ctx: _Context, first: _Scene, second: _Scene, kind: str) -> 
             f"[0:v]{a}[va];[1:v]{b}[vb];"
             f"[va][vb]xfade=transition={kind}:duration={shared / ctx.fps:.6f}:offset=0[v]"
         )
+        mapped = "[v]"
+        if flash:
+            graph += ";" + scene_look.flash_graph(flash, ctx.fps, ctx.width, ctx.height, shared)
+            mapped = "[vf]"
         (work / "graph.txt").write_text(graph, encoding="utf-8")
         _ffmpeg(
             [*_input(first.video), *_input(second.video), "-filter_complex_script", "graph.txt",
-             "-map", "[v]", "-frames:v", str(shared), "-an", *ENCODE, "-r", str(ctx.fps),
+             "-map", mapped, "-frames:v", str(shared), "-an", *ENCODE, "-r", str(ctx.fps),
              str(staged)],
             work, f"transition {first.id} to {second.id}",
         )
@@ -675,6 +686,7 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
             audio_sha=status["stages"][f"{scene.id}:audio"]["sha256"],
             lines=lines, lines_key=scene_text.overlay_key(lines),
             volume_db=scene.volume_db,
+            look=scene_look.look_filters(scene_look.merge_look(manifest.look, scene.look)),
         ))
 
     video_segments: list[Path] = []
@@ -686,7 +698,8 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
             audio_segments.append(_audio_body(ctx, scene))
         if index < len(scenes) - 1 and scene.tail > 0:
             kind = TRANSITION_TYPES[manifest.scenes[index].transition.type]
-            video_segments.append(_video_junction(ctx, scene, scenes[index + 1], kind))
+            video_segments.append(_video_junction(ctx, scene, scenes[index + 1], kind,
+                                                manifest.scenes[index].transition.flash))
             audio_segments.append(_audio_junction(ctx, scene, scenes[index + 1]))
         progress(f"  {scene.id}: segments ready")
 

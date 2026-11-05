@@ -87,6 +87,7 @@ to anything other than null is an error.
 | `captions` | used | Default caption settings for every scene: `{enabled, mode, style}` |
 | `text_card_style` | used | Default style for every text card |
 | `loudness` | used | `{target_lufs, true_peak_db}`: normalise the final audio; off unless set. Defaults -14 LUFS and -1.5 dBTP (target -50 to -5, peak -9 to 0) |
+| `look` | used | Default look for every scene: `{vignette, grade}` (see Look). Off unless set |
 
 ### `bgm`
 
@@ -117,7 +118,8 @@ to anything other than null is an error.
 | `volume_db` | used | Gain for this scene's narration in dB, -30 to 12, default 0. Applied in the post stages, separately from `settings.narration_volume`; only that scene's narration segments (and its junctions) rebuild |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
 | `text_cards` | used | List of `{text, style, start, end, kind, label, value, source}`, up to 20 (see Text card kinds) |
-| `transition` | used | `{type, duration}`; joins this scene to the next |
+| `transition` | used | `{type, duration, flash}`; joins this scene to the next. `flash` is optional (see Look) |
+| `look` | used | `{vignette, grade}` for this scene; overrides `settings.look` field by field |
 
 `assets[]` entries: `file` (filename in `assets/`), `start` (seconds into a video
 file where playing begins, default 0; not for images), `duration` (seconds on the
@@ -419,6 +421,30 @@ graphics. Narration still crossfades with equal power for every type.
 - Warnings are added to the build result when the output is more than 1 LU from the
   target or the true peak is more than 0.3 dB over the limit after the AAC encode.
 - Silent audio cannot be measured and fails the build with a clear message.
+
+### Look
+
+All optional and off by default. A manifest without `look` or `flash` renders exactly as before.
+
+```json
+"settings": {"look": {"vignette": {"amount": 0.35}, "grade": {"preset": "warm", "contrast": 1.05}}}
+"transition": {"type": "crossfade", "duration": 0.5, "flash": {"duration": 0.08, "strength": 0.8, "color": "#FFFFFF"}}
+```
+
+- `vignette.amount`: 0 to 1; darkens the corners (0 is off).
+- `grade`: `preset` (`warm`, `cool`, `faded`, `high_contrast`) and/or `contrast` (0.5 to 2),
+  `saturation` (0 to 3), `brightness` (-0.5 to 0.5). Your numbers replace the preset's own
+  contrast, saturation and brightness; `warm` and `cool` also shift the colour balance.
+- The grade and the vignette are applied to the picture under the text, in the scene body and
+  on both sides of a transition, so the look is the same across the overlap. A scene's `look`
+  overrides `settings.look` per key (`vignette`, `grade`) and per field.
+- `flash`: a brief colour flash over the middle of a transition. `duration` 0.03 to 0.3 s and
+  shorter than the transition, `strength` above 0 up to 1 (default 0.8), `color` `#RRGGBB`
+  (default white). It is a solid colour overlaid with a rising and falling alpha, so at low
+  frame rates a short flash may be only a frame or two. A cut cannot flash.
+- Grain is not part of this tier (file size and encode time).
+- Changing a scene's look rebuilds that scene's picture segments and its junctions; changing a
+  flash rebuilds only that junction and the joins.
 
 ### Caching and what rebuilds
 

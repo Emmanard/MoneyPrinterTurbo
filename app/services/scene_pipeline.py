@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
-from app.services import scene_text
+from app.services import scene_look, scene_text
 from app.services.video_project import (
     _ID,
     ProjectError,
@@ -73,12 +73,12 @@ RESERVED_SCENE_FIELDS: tuple[str, ...] = ()
 USED_TOP_LEVEL = frozenset({"schema_version", "project_id", "voice", "settings", "bgm", "scenes"})
 USED_SCENE_FIELDS = frozenset({
     "id", "narration", "asset", "assets", "audio", "motion", "fit", "pause_after",
-    "captions", "text_cards", "transition", "volume_db",
+    "captions", "text_cards", "transition", "volume_db", "look",
 })
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
 TEXT_SETTINGS = ("captions", "text_card_style")
-USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness",)
+USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness", "look")
 
 # Final loudness normalisation (two-pass loudnorm), off unless settings.loudness is set.
 DEFAULT_TARGET_LUFS = -14.0
@@ -153,6 +153,7 @@ class AssetRef:
 class Transition:
     type: str
     duration: float
+    flash: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,7 @@ class Scene:
     text_cards: tuple = ()
     transition: Transition | None = None
     volume_db: float = 0.0
+    look: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,7 @@ class SceneManifest:
     text_card_style: dict | None = None
     bgm: Bgm | None = None
     loudness: Loudness | None = None
+    look: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -298,6 +301,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     caption_defaults: dict = {}
     card_defaults: dict = {}
     loudness = None
+    look_default: dict = {}
     if not isinstance(settings_raw, dict):
         errors.append("settings: must be an object")
     else:
@@ -326,6 +330,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
             padding = DEFAULT_TRIM_PADDING
         trim = TrimSettings(enabled, float(padding))
         loudness = _parse_loudness(settings_raw.get("loudness"), errors)
+        look_default = scene_look.parse_look(settings_raw.get("look"), "settings.look", errors)
 
     voice_name = None
     voice_rate = 1.0
@@ -418,6 +423,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
             errors.append(
                 f"{label}.volume_db: must be a number of dB from {MIN_VOLUME_DB:g} to {MAX_VOLUME_DB:g}")
             volume_db = 0
+        look = scene_look.parse_look(item.get("look"), f"{label}.look", errors)
         captions = scene_text.parse_caption_spec(item.get("captions"), f"{label}.captions", errors)
         cards = scene_text.parse_text_cards(item.get("text_cards"), label, errors)
         transition = _parse_transition(
@@ -439,6 +445,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
                 assets=assets,
                 pause_after=float(pause_after),
                 volume_db=float(volume_db),
+                look=look or None,
                 captions=captions,
                 text_cards=cards,
                 transition=transition,
@@ -451,7 +458,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     if errors or settings is None:
         raise ManifestError("\n".join(dict.fromkeys(errors)))
     return SceneManifest(project_id, voice_name, voice_rate, settings, trim, tuple(scenes),
-                         caption_defaults, card_defaults, bgm, loudness)
+                         caption_defaults, card_defaults, bgm, loudness, look_default)
 
 
 def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> tuple[AssetRef, ...]:
@@ -501,7 +508,7 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
         errors.append(f"{label}.transition: must be an object")
         return None
     for key in raw:
-        if key not in ("type", "duration"):
+        if key not in ("type", "duration", "flash"):
             errors.append(f"{label}.transition: unknown field: {key}")
     kind = raw.get("type")
     if kind not in TRANSITION_TYPES:
@@ -509,6 +516,8 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
         return None
     duration = raw.get("duration", DEFAULT_TRANSITION_SECONDS)
     if kind == "cut":
+        if "flash" in raw:
+            errors.append(f"{label}.transition.flash: a cut has no overlap to flash over")
         return Transition("cut", 0.0)
     if not _is_number(duration) or not MIN_TRANSITION_SECONDS <= duration <= MAX_TRANSITION_SECONDS:
         errors.append(
@@ -522,7 +531,8 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
             f"{fps} fps; the minimum for this frame rate is {MIN_TRANSITION_FRAMES / fps:.3g}s"
         )
         return None
-    return Transition(kind, float(duration))
+    flash = scene_look.parse_flash(raw.get("flash"), f"{label}.transition", float(duration), errors)
+    return Transition(kind, float(duration), flash)
 
 
 def _parse_loudness(raw: object, errors: list[str]) -> Loudness | None:
@@ -1264,9 +1274,11 @@ def ensure_scene_visual(project: Path, manifest: SceneManifest, scene: Scene,
 def uses_post(manifest: SceneManifest) -> bool:
     """True when the manifest needs the post stages: captions, text cards,
     transitions, pauses or music. Without any of them the original path runs."""
-    if manifest.bgm is not None or manifest.loudness is not None:
+    if manifest.bgm is not None or manifest.loudness is not None or scene_look.look_filters(manifest.look or {}):
         return True
     for scene in manifest.scenes:
+        if scene.look and scene_look.look_filters(scene.look):
+            return True
         if scene.pause_after > 0 or scene.text_cards or scene.volume_db:
             return True
         if scene.transition is not None and scene.transition.type != "cut":

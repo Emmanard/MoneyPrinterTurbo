@@ -276,3 +276,13 @@ so the fades go on the music stem inside the existing final mix and the gain goe
 existing narration segments. Per-scene gain and fades enter cache keys only when set, so old
 manifests keep their keys. `plan` shows fades and gains, and reports fades longer than the
 video.
+
+**E3 look (built):** `settings.look` and `scenes[].look` with a vignette and a colour grade
+(presets plus contrast, saturation, brightness), and `transition.flash`. Grain is deferred, as
+decided in the proposal. Code is in the new `app/services/scene_look.py`. The look sits in the
+per-scene chain before the text, so it applies to the body and to both sides of a junction.
+Look and flash enter the cache keys only when set. Changes from the proposal:
+the flash is a solid colour overlay with an alpha envelope (`fade ... alpha=1`) instead of an
+`eq` brightness pulse, because that supports a flash colour and was checked in the container
+before use; the vignette angle grows with `amount` (a larger lens angle darkens more, measured
+in the container; my first guess had the direction reversed and a test caught it).

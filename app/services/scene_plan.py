@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 from app.services import scene_pipeline as sp
-from app.services import scene_post, scene_text
+from app.services import scene_look, scene_post, scene_text
 
 PENDING_NOTE = (
     "narration is not generated yet: length, per-asset durations, card windows and "
@@ -172,6 +172,10 @@ def build_plan(project: Path) -> dict:
             {"type": scene.transition.type, "frames": tails[index], "seconds": _round(tails[index] / fps)}
             if tails[index] else None
         )
+        look = scene_look.look_filters(scene_look.merge_look(manifest.look, scene.look))
+        entry["look"] = look or None
+        if entry["transition"] and scene.transition.flash:
+            entry["transition"]["flash"] = scene.transition.flash
         entry["assets"] = _asset_rows(manifest, scene, infos, trimmed_lengths[index], entry["problems"])
         entry["cards"] = _card_rows(manifest, scene, length, entry["problems"])
         caption = scene_text.merge_caption(manifest.captions, scene.captions)
@@ -266,6 +270,11 @@ def format_text(plan: dict) -> str:
             if kind != "plain":
                 detail += f", {kind}"
             lines.append(f"  card {c['index']}: {window} [{detail}] {shown}")
+        if e.get("look"):
+            lines.append(f"  look: {e['look']}")
+        if e.get("transition") and e["transition"].get("flash"):
+            flash = e["transition"]["flash"]
+            lines.append(f"  flash: {flash['duration']:g} s, strength {flash['strength']:g}, {flash['color']}")
         if e.get("volume_db"):
             lines.append(f"  narration gain: {e['volume_db']:+g} dB")
         cap = e["captions"]

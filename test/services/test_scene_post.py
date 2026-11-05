@@ -1588,3 +1588,214 @@ def test_plan_shows_fades_and_gain(project, capsys):
     _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "fade_in": 1.0, "fade_out": 1.0})
     assert sp.main(["--project", str(project), "plan", "--text"]) == 1
     assert "longer than the video" in capsys.readouterr().out
+
+
+# -- E3: look (grade, vignette) and the flash on a transition -------------------
+
+from app.services import scene_look  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,message", [
+    ("warm", "look: must be an object"),
+    ({"glow": {}}, "look: unknown field: glow"),
+    ({"vignette": 0.3}, "vignette: must be an object"),
+    ({"vignette": {"amount": 2}}, "vignette.amount: must be a number from 0 to 1"),
+    ({"vignette": {"strength": 0.2}}, "vignette: unknown field: strength"),
+    ({"grade": {}}, "grade: give a preset or at least one"),
+    ({"grade": {"preset": "neon"}}, "grade.preset: must be one of warm, cool, faded, high_contrast"),
+    ({"grade": {"contrast": 3}}, "grade.contrast: must be a number from 0.5 to 2"),
+    ({"grade": {"saturation": -1}}, "grade.saturation: must be a number from 0 to 3"),
+    ({"grade": {"brightness": 0.9}}, "grade.brightness: must be a number from -0.5 to 0.5"),
+    ({"grade": {"hue": 1}}, "grade: unknown field: hue"),
+])
+def test_look_is_validated(raw, message):
+    errors = []
+    scene_look.parse_look(raw, "look", errors)
+    assert any(message in e for e in errors), errors
+
+
+def test_look_is_empty_by_default_and_adds_nothing():
+    assert scene_look.parse_look(None, "look", []) == {}
+    assert scene_look.look_filters({}) == "" and scene_look.look_key({}) is None
+    assert scene_look.look_filters({"vignette": {"amount": 0.0}}) == ""
+    assert scene_look.look_filters({"grade": {"contrast": 1.0, "saturation": 1.0, "brightness": 0.0}}) == ""
+
+
+def test_look_filters_for_each_part():
+    assert scene_look.look_filters({"grade": {"contrast": 1.2}}) == "eq=contrast=1.2:saturation=1:brightness=0"
+    warm = scene_look.look_filters({"grade": {"preset": "warm"}})
+    assert warm.startswith("eq=contrast=1.04:saturation=1.08") and ",colorbalance=rs=0.06" in warm
+    override = scene_look.look_filters({"grade": {"preset": "faded", "saturation": 1.0}})
+    assert "saturation=1:" in override and "contrast=0.88" in override
+    weak = scene_look.look_filters({"vignette": {"amount": 0.2}})
+    strong = scene_look.look_filters({"vignette": {"amount": 0.9}})
+    angle = lambda text: float(text.split("angle=")[1])  # noqa: E731
+    assert 0 < angle(weak) < angle(strong) < 1.5708
+    both = scene_look.look_filters({"grade": {"preset": "cool"}, "vignette": {"amount": 0.5}})
+    assert both.index("eq=") < both.index("colorbalance") < both.index("vignette")
+
+
+def test_a_scene_look_overrides_the_project_look_field_by_field():
+    default = {"vignette": {"amount": 0.4}, "grade": {"preset": "warm", "contrast": 1.1}}
+    scene = {"grade": {"contrast": 1.3}}
+    merged = scene_look.merge_look(default, scene)
+    assert merged == {"vignette": {"amount": 0.4}, "grade": {"preset": "warm", "contrast": 1.3}}
+    assert scene_look.merge_look(None, None) == {}
+
+
+@pytest.mark.parametrize("flash,message", [
+    ("white", "flash: must be an object"),
+    ({"duration": 0.01}, "flash.duration: must be a number from 0.03 to 0.3"),
+    ({"duration": 0.6}, "flash.duration: must be a number from 0.03 to 0.3"),
+    ({"duration": 0.3}, "flash.duration: must be shorter than the transition"),
+    ({"duration": 0.1, "strength": 0}, "flash.strength: must be a number above 0 and at most 1"),
+    ({"duration": 0.1, "color": "white"}, "flash.color: must be a color like #RRGGBB"),
+    ({"duration": 0.1, "speed": 1}, "flash: unknown field: speed"),
+])
+def test_flash_is_validated(project, flash, message):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.3, "flash": flash}),
+                     _scene("s2", "two.wav", "b.png")])
+    assert message in _errors(project)
+
+
+def test_a_cut_has_nothing_to_flash(project):
+    _write(project, [_scene("s1", transition={"type": "cut", "flash": {"duration": 0.1}}),
+                     _scene("s2", "two.wav", "b.png")])
+    assert "a cut has no overlap to flash over" in _errors(project)
+
+
+def test_look_in_settings_and_scene_parse_and_switch_on_the_post_stages(project):
+    manifest = {"schema_version": 1, "project_id": "ep", "scenes": [_scene("s1")],
+                "settings": {**SETTINGS, "look": {"vignette": {"amount": 0.3}}}}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = sp.load_manifest(project)
+    assert loaded.look == {"vignette": {"amount": 0.3}} and sp.uses_post(loaded)
+    _write(project, [_scene("s1", look={"grade": {"preset": "warm"}})])
+    assert sp.uses_post(sp.load_manifest(project))
+    _write(project, [_scene("s1", look={})])
+    assert not sp.uses_post(sp.load_manifest(project))
+
+
+def _flat(project, name="flat.png", color="0x808080"):
+    _ff(["-f", "lavfi", "-i", f"color=c={color}:s=270x480", "-frames:v", "1", str(project / "assets" / name)])
+    return name
+
+
+def _mean_rgb(image, box):
+    crop = image.convert("RGB").crop(box)
+    pixels = list(crop.getdata())
+    return tuple(sum(p[i] for p in pixels) / len(pixels) for i in range(3))
+
+
+def test_vignette_darkens_the_corners_only_when_asked(project):
+    flat = _flat(project)
+    _write(project, [_scene("s1", asset=flat, motion="static")])
+    plain = Image.open(_frame(_build(project)["output"], 0.5, project / "plain.png"))
+    _write(project, [_scene("s1", asset=flat, motion="static", look={"vignette": {"amount": 1.0}})])
+    shaded = Image.open(_frame(_build(project)["output"], 0.5, project / "shaded.png"))
+    corner, centre = (0, 0, 30, 30), (120, 210, 150, 270)
+    assert abs(_luma(plain, corner) - _luma(plain, centre)) < 3
+    assert _luma(shaded, corner) < _luma(shaded, centre) - 40
+    assert abs(_luma(shaded, centre) - _luma(plain, centre)) < 12
+
+
+def test_warm_grade_shifts_colour_toward_red_and_cool_toward_blue(project):
+    flat = _flat(project)
+    centre = (100, 200, 170, 280)
+    results = {}
+    for name, look in (("none", {}), ("warm", {"grade": {"preset": "warm"}}), ("cool", {"grade": {"preset": "cool"}})):
+        _write(project, [_scene("s1", asset=flat, motion="static", look=look)])
+        results[name] = _mean_rgb(Image.open(_frame(_build(project)["output"], 0.5, project / f"{name}.png")), centre)
+    base_r, _, base_b = results["none"]
+    assert results["warm"][0] - results["warm"][2] > (base_r - base_b) + 8
+    assert results["cool"][2] - results["cool"][0] > (base_b - base_r) + 8
+
+
+def test_contrast_and_brightness_change_the_picture(project):
+    flat = _flat(project, color="0x606060")
+    centre = (100, 200, 170, 280)
+    _write(project, [_scene("s1", asset=flat, motion="static")])
+    base = _luma(Image.open(_frame(_build(project)["output"], 0.5, project / "a.png")), centre)
+    _write(project, [_scene("s1", asset=flat, motion="static", look={"grade": {"brightness": 0.2}})])
+    bright = _luma(Image.open(_frame(_build(project)["output"], 0.5, project / "b.png")), centre)
+    assert bright > base + 25
+
+
+def test_a_look_leaves_the_timeline_length_alone(project):
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", "b.png")])
+    plain = _build(project)
+    _write(project, [_scene("s1", look={"grade": {"preset": "faded"}, "vignette": {"amount": 0.6}}),
+                     _scene("s2", "two.wav", "b.png")])
+    styled = _build(project)
+    assert styled["frames"] == 14 + 9
+    assert abs(_duration(styled["output"]) - _duration(plain["output"])) < 0.05
+
+
+def test_a_look_change_rebuilds_only_that_scene_and_its_junction(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.3}),
+              _scene("s2", "two.wav", "b.png"), _scene("s3", "three.wav", "a.png")]
+    _write(project, scenes)
+    _build(project)
+    _write(project, [dict(scenes[0], look={"vignette": {"amount": 0.5}}), scenes[1], scenes[2]])
+    rebuilt = _rebuilt(_build(project))
+    assert "s1:picture" in rebuilt and "s1>s2:picture" in rebuilt
+    assert "s3:picture" not in rebuilt and "s2:picture" not in rebuilt and "s1:narration" not in rebuilt
+
+
+def test_an_empty_look_keeps_the_cache_keys_of_a_manifest_without_one(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.3}), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[0]["look"] = {}
+    scenes[0]["transition"]["flash"] = None
+    _write(project, scenes)
+    assert _rebuilt(_build(project)) == set()
+
+
+def test_flash_brightens_the_middle_of_the_transition_only(project):
+    scenes = [_scene("s1", asset="b.png", motion="static", transition={"type": "crossfade", "duration": 0.5}),
+              _scene("s2", "two.wav", "a.png", motion="static")]
+    _write(project, scenes)
+    plain = _build(project)["output"]
+    plain_mid = _luma(Image.open(_frame(plain, 1.1, project / "p_mid.png")), (0, 0, 270, 480))
+    plain_early = _frame(plain, 0.4, project / "p_early.png")
+    scenes[0]["transition"]["flash"] = {"duration": 0.2, "strength": 1.0, "color": "#FFFFFF"}
+    _write(project, scenes)
+    flashed = _build(project)
+    out = flashed["output"]
+    mid = _luma(Image.open(_frame(out, 1.1, project / "f_mid.png")), (0, 0, 270, 480))
+    assert mid > plain_mid + 25
+    assert _psnr(plain_early, _frame(out, 0.4, project / "f_early.png")) > 35   # before the transition
+    assert flashed["frames"] == 14 + 9 - 5                                   # length unchanged
+
+
+def test_flash_colour_is_used(project):
+    scenes = [_scene("s1", asset="b.png", motion="static",
+                     transition={"type": "crossfade", "duration": 0.5,
+                                 "flash": {"duration": 0.2, "strength": 1.0, "color": "#FF0000"}}),
+              _scene("s2", "two.wav", "a.png", motion="static")]
+    _write(project, scenes)
+    r, g, b = _mean_rgb(Image.open(_frame(_build(project)["output"], 1.1, project / "red.png")), (0, 0, 270, 480))
+    assert r > g + 40 and r > b + 40
+
+
+def test_a_flash_change_rebuilds_only_its_junction_and_the_joins(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.4,
+                                       "flash": {"duration": 0.1, "strength": 0.5}}),
+              _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[0]["transition"]["flash"]["strength"] = 0.9
+    _write(project, scenes)
+    rebuilt = _rebuilt(_build(project))
+    assert "s1>s2:picture" in rebuilt and "s1:picture" not in rebuilt and "s2:picture" not in rebuilt
+    assert not any(label.endswith("narration") for label in rebuilt - {"join:narration"})
+
+
+def test_plan_shows_look_and_flash(project, capsys):
+    _write(project, [_scene("s1", look={"grade": {"preset": "warm"}, "vignette": {"amount": 0.4}},
+                            transition={"type": "crossfade", "duration": 0.4, "flash": {"duration": 0.1}}),
+                     _scene("s2", "two.wav", "b.png")])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    text = capsys.readouterr().out
+    assert "look: eq=contrast=1.04" in text and "flash: 0.1 s, strength 0.8, #FFFFFF" in text
