@@ -557,3 +557,124 @@ def test_the_project_accent_colour_colours_every_kind():
     assert _boxes(_card_overlays(_fact(), defaults=defaults))[1].color == "#00AAFF"
     own = _card_overlays(_fact(style={"accent_color": "#FF0000"}), defaults=defaults)
     assert _lines(own)[0].color == "#FF0000" and _boxes(own)[1].color == "#FF0000"
+
+
+# -- E4: card animation ----------------------------------------------------------
+
+def _animated(card, animation=None, default=None):
+    return st.scene_overlays("", 5.0, {"enabled": False}, (card,), {}, 1080, 1920, default) if animation is None \
+        else st.scene_overlays("", 5.0, {"enabled": False},
+                               (st.TextCard(card.text, card.style, card.start, card.end, card.kind, card.label,
+                                            card.value, card.source, animation),), {}, 1080, 1920, default)
+
+
+@pytest.mark.parametrize("raw,message", [
+    ("fade", "animation: must be an object"),
+    ({"speed": 2}, "animation: unknown field: speed"),
+    ({"in": "spin"}, "animation.in: must be one of none, fade, slide_up, slide_left"),
+    ({"out": "slide_up"}, "animation.out: must be one of none, fade"),
+    ({"duration": 0.01}, "animation.duration: must be a number from 0.05 to 2 seconds"),
+    ({"duration": 3}, "animation.duration: must be a number from 0.05 to 2 seconds"),
+    ({"stagger": 0.9}, "animation.stagger: must be a number from 0 to 0.5 seconds"),
+    ({"stagger": -0.1}, "animation.stagger: must be a number from 0 to 0.5 seconds"),
+])
+def test_animation_is_validated(raw, message):
+    errors = []
+    st.parse_text_cards([{"text": "x", "start": 0, "end": 3, "animation": raw}], "scene s1", errors)
+    assert any(message in e for e in errors), errors
+
+
+def test_a_card_has_no_animation_by_default():
+    errors = []
+    (card,) = st.parse_text_cards([{"text": "x", "start": 0, "end": 3}], "scene s1", errors)
+    assert card.animation is None and st.resolve_animation(card.animation, None) is None
+    assert st.resolve_animation({"in": "none", "out": "none"}, None) is None
+
+
+def test_the_project_animation_default_and_the_card_override():
+    default = {"in": "slide_up", "duration": 0.4, "stagger": 0.1}
+    assert st.resolve_animation(None, default) == ("slide_up", "none", 0.4, 0.1)
+    assert st.resolve_animation({"out": "fade", "duration": 0.2}, default) == ("slide_up", "fade", 0.2, 0.1)
+    assert st.resolve_animation({"in": "none"}, default) is None
+    assert st.resolve_animation({"in": "fade"}, None) == ("fade", "none", st.DEFAULT_ANIM_SECONDS, 0.0)
+
+
+def test_a_static_card_keeps_its_items_rows_and_filters_when_animation_exists_elsewhere():
+    card = st.TextCard("Hello there", {}, 0.3, 2.0)
+    still = _animated(card)
+    assert all(i.anim is None for i in still)
+    assert all(len(row) == 12 for row in st.overlay_key(still)[0])
+    chain = st.drawtext_chain(still, "p").filters
+    assert "alpha=" not in chain and "pow(" not in chain and "y=" in chain
+
+
+def test_fade_in_and_out_expressions():
+    card = st.TextCard("Hello", {}, 1.0, 3.0)
+    items = _animated(card, {"in": "fade", "out": "fade", "duration": 0.4})
+    chain = st.drawtext_chain(items, "c").filters
+    assert "alpha='clip((t-1.000)/0.4,0,1)*clip((3.000-t)/0.4,0,1)'" in chain
+    assert "y=" in chain and "pow(" not in chain
+
+
+def test_slide_up_and_slide_left_expressions():
+    up = st.drawtext_chain(_animated(st.TextCard("Hi", {"position": "top"}, 1.0, 3.0), {"in": "slide_up"}), "c").filters
+    line = _animated(st.TextCard("Hi", {"position": "top"}, 1.0, 3.0), {"in": "slide_up"})[0]
+    assert f"y='{line.y}+{round(line.size)}*pow(1-clip((t-1.000)/0.3,0,1),3)'" in up
+    assert "x=(w-text_w)/2" in up and "alpha='clip((t-1.000)/0.3,0,1)'" in up
+    left = st.drawtext_chain(_animated(st.TextCard("Hi", {"align": "left"}, 1.0, 3.0), {"in": "slide_left"}), "c").filters
+    assert "x='" in left and "pow(1-clip((t-1.000)/0.3,0,1),3)'" in left and f"y={line.y}" in left or "y=" in left
+
+
+def test_fade_out_only_has_no_entrance_motion():
+    items = _animated(st.TextCard("Hello", {}, 1.0, 3.0), {"out": "fade", "duration": 0.5})
+    chain = st.drawtext_chain(items, "c").filters
+    assert "alpha='clip((3.000-t)/0.5,0,1)'" in chain and "pow(" not in chain
+
+
+def test_stagger_starts_each_part_later_and_the_label_lands_first():
+    card = _claim(start=1.0, end=4.0)
+    items = _animated(card, {"in": "fade", "duration": 0.3, "stagger": 0.2})
+    lines = _lines(items)
+    delays = {i.text: i.anim[3] for i in lines}
+    label = next(i for i in lines if i.text == "TMZ")
+    assert label.anim[3] == 0.0
+    claim_delays = {i.anim[3] for i in lines if i.text != "TMZ"}
+    assert claim_delays == {0.2}                       # all lines of the claim start together
+    chain = st.drawtext_chain(items, "c").filters
+    assert "alpha='clip((t-1.000)/0.3,0,1)'" in chain and "alpha='clip((t-1.200)/0.3,0,1)'" in chain
+    assert delays["TMZ"] < min(d for t, d in delays.items() if t != "TMZ")
+
+
+def test_the_panel_and_the_bar_cut_in_and_out_while_the_text_animates():
+    items = _animated(_fact(start=1.0, end=3.0), {"in": "slide_up", "out": "fade", "duration": 0.3, "stagger": 0.1})
+    chain = st.drawtext_chain(items, "c").filters
+    import re
+    boxes = [p for p in re.split(r",(?=draw(?:box|text)=)", chain) if p.startswith("drawbox=")]
+    assert len(boxes) == 2 and all("alpha=" not in b and "pow(" not in b for b in boxes)
+    assert all("enable='gte(t,1.000)*lt(t,3.000)'" in b for b in boxes)
+    assert "alpha=" in chain and "pow(" in chain
+
+
+def test_an_animation_that_does_not_fit_the_window_is_rejected():
+    with pytest.raises(st.TextLayoutError, match="animation needs"):
+        _animated(st.TextCard("Hello", {}, 0, 0.5), {"in": "fade", "out": "fade", "duration": 0.4})
+    with pytest.raises(st.TextLayoutError, match="animation needs"):
+        _animated(_claim(start=0, end=0.5), {"in": "fade", "duration": 0.4, "stagger": 0.3})
+    assert _animated(_claim(start=0, end=1.5), {"in": "fade", "duration": 0.4, "stagger": 0.3})
+
+
+def test_animation_changes_the_overlay_key_only_when_set():
+    card = st.TextCard("Hello", {}, 0.0, 3.0)
+    base = st.overlay_key(_animated(card))
+    fade = st.overlay_key(_animated(card, {"in": "fade"}))
+    slide = st.overlay_key(_animated(card, {"in": "slide_up"}))
+    longer = st.overlay_key(_animated(card, {"in": "fade", "duration": 0.6}))
+    assert len({str(base), str(fade), str(slide), str(longer)}) == 4
+    assert base == st.overlay_key(_animated(card, None, {"in": "none"}))
+
+
+def test_a_default_animation_applies_to_every_card_kind():
+    default = {"in": "fade", "duration": 0.2}
+    for card in (st.TextCard("Plain", {}, 0, 2), _claim(start=0, end=2), _fact(start=0, end=2), _quote(start=0, end=2)):
+        items = _animated(card, None, default)
+        assert all(i.anim == ("fade", "none", 0.2, 0.0) for i in _lines(items))

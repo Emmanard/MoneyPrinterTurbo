@@ -78,7 +78,7 @@ USED_SCENE_FIELDS = frozenset({
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
 TEXT_SETTINGS = ("captions", "text_card_style")
-USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness", "look")
+USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness", "look", "text_card_animation")
 
 # Final loudness normalisation (two-pass loudnorm), off unless settings.loudness is set.
 DEFAULT_TARGET_LUFS = -14.0
@@ -224,6 +224,7 @@ class SceneManifest:
     bgm: Bgm | None = None
     loudness: Loudness | None = None
     look: dict | None = None
+    text_card_animation: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +303,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     card_defaults: dict = {}
     loudness = None
     look_default: dict = {}
+    animation_default: dict = {}
     if not isinstance(settings_raw, dict):
         errors.append("settings: must be an object")
     else:
@@ -331,6 +333,8 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
         trim = TrimSettings(enabled, float(padding))
         loudness = _parse_loudness(settings_raw.get("loudness"), errors)
         look_default = scene_look.parse_look(settings_raw.get("look"), "settings.look", errors)
+        animation_default = scene_text.parse_animation(
+            settings_raw.get("text_card_animation"), "settings.text_card_animation", errors)
 
     voice_name = None
     voice_rate = 1.0
@@ -458,7 +462,8 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     if errors or settings is None:
         raise ManifestError("\n".join(dict.fromkeys(errors)))
     return SceneManifest(project_id, voice_name, voice_rate, settings, trim, tuple(scenes),
-                         caption_defaults, card_defaults, bgm, loudness, look_default)
+                         caption_defaults, card_defaults, bgm, loudness, look_default,
+                         animation_default or None)
 
 
 def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> tuple[AssetRef, ...]:

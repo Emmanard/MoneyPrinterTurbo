@@ -87,6 +87,7 @@ to anything other than null is an error.
 | `captions` | used | Default caption settings for every scene: `{enabled, mode, style}` |
 | `text_card_style` | used | Default style for every text card |
 | `loudness` | used | `{target_lufs, true_peak_db}`: normalise the final audio; off unless set. Defaults -14 LUFS and -1.5 dBTP (target -50 to -5, peak -9 to 0) |
+| `text_card_animation` | used | Default `{in, out, duration, stagger}` for every text card (see Card animation). Off unless set |
 | `look` | used | Default look for every scene: `{vignette, grade}` (see Look). Off unless set |
 
 ### `bgm`
@@ -117,7 +118,7 @@ to anything other than null is an error.
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
 | `volume_db` | used | Gain for this scene's narration in dB, -30 to 12, default 0. Applied in the post stages, separately from `settings.narration_volume`; only that scene's narration segments (and its junctions) rebuild |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
-| `text_cards` | used | List of `{text, style, start, end, kind, label, value, source}`, up to 20 (see Text card kinds) |
+| `text_cards` | used | List of `{text, style, start, end, kind, label, value, source, animation}`, up to 20 (see Text card kinds and Card animation) |
 | `transition` | used | `{type, duration, flash}`; joins this scene to the next. `flash` is optional (see Look) |
 | `look` | used | `{vignette, grade}` for this scene; overrides `settings.look` field by field |
 
@@ -265,6 +266,30 @@ Captions reject the card-only keys (`align`, `panel`, `panel_color`, `panel_opac
   any `pause_after`). `end` must not be later than the scene's length; this is
   checked once the narration length is known, before rendering.
 - Multi-line cards are drawn as centered lines, one per wrapped line.
+
+### Card animation
+
+Optional and off by default. A card without `animation` (and no `settings.text_card_animation`)
+renders exactly as before.
+
+```json
+{"kind": "claim", "label": "TMZ", "text": "Fight with another inmate", "start": 0.3, "end": 5.3,
+ "animation": {"in": "slide_up", "out": "fade", "duration": 0.3, "stagger": 0.12}}
+```
+
+- `in`: `none` (default), `fade`, `slide_up` (the text rises into place, fading in) or `slide_left`
+  (it moves in from the left, fading in). `out`: `none` (default) or `fade` before the card ends.
+- `duration`: seconds for each of the entrance and the exit, 0.05 to 2 (default 0.3).
+- `stagger`: 0 to 0.5 s (default 0). Each part of a card starts that much after the one above it,
+  so on a claim card the label lands first and the claim follows; on a fact card the label, the
+  value and the caption arrive in order. All lines of one part start together.
+- The panel and the accent bar do not animate: they cut in at `start` and out at `end` while the
+  text animates over them. A plain card's per-line box fades with its text.
+- The entrance, the exit and the stagger must fit in the card's time on screen
+  (`delay + in + out` at most `end - start`); this is checked before rendering and by `plan`.
+- Slides move by about one font size, ease out (cubic) and are drawn with `drawtext` expressions
+  of time; there are no new filters or stages. Captions do not animate.
+- Changing an animation rebuilds that scene's picture segments and junctions, like a text change.
 
 ### Text card kinds
 

@@ -52,6 +52,14 @@ QUOTE_SOURCE_COLOR = "#D0D0D0"
 QUOTE_MARK_SCALE = 2.4   # the opening mark is drawn this many times the base size
 QUOTE_MARK_HEIGHT = 0.45  # and reserves this share of its line height (the glyph sits at the top)
 DEFAULT_ACCENT_WIDTH = 10
+ANIM_IN = ("none", "fade", "slide_up", "slide_left")
+ANIM_OUT = ("none", "fade")
+ANIM_KEYS = ("in", "out", "duration", "stagger")
+MIN_ANIM_SECONDS = 0.05
+MAX_ANIM_SECONDS = 2.0
+DEFAULT_ANIM_SECONDS = 0.3
+MAX_STAGGER_SECONDS = 0.5
+SLIDE_DISTANCE = 1.0  # a slide starts this many font sizes away from its final place
 DEFAULT_ACCENT = "#FFD400"
 # Defaults a card kind applies on top of settings.text_card_style (a card's own style wins).
 KIND_DEFAULTS = {
@@ -99,6 +107,7 @@ class TextCard:
     label: str = ""
     value: str = ""
     source: str = ""
+    animation: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,7 @@ class DrawLine:
     start: float
     end: float
     x: int | None = None  # left edge; None = centred
+    anim: tuple | None = None  # (in, out, duration, delay) for an animated card line
 
 
 @dataclass(frozen=True)
@@ -255,6 +265,51 @@ def parse_caption_spec(raw: object, label: str, errors: list[str]) -> dict | Non
     return spec
 
 
+def parse_animation(raw: object, label: str, errors: list[str]) -> dict:
+    """Validate {in, out, duration, stagger}; return only the keys that were given."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        errors.append(f"{label}: must be an object like {{\"in\": \"slide_up\", \"duration\": 0.3}}")
+        return {}
+    spec: dict = {}
+    for key, value in raw.items():
+        if key not in ANIM_KEYS:
+            errors.append(f"{label}: unknown field: {key}")
+        elif key == "in":
+            if value not in ANIM_IN:
+                errors.append(f"{label}.in: must be one of {', '.join(ANIM_IN)}")
+            else:
+                spec[key] = value
+        elif key == "out":
+            if value not in ANIM_OUT:
+                errors.append(f"{label}.out: must be one of {', '.join(ANIM_OUT)}")
+            else:
+                spec[key] = value
+        elif key == "duration":
+            if not _is_number(value) or not MIN_ANIM_SECONDS <= value <= MAX_ANIM_SECONDS:
+                errors.append(f"{label}.duration: must be a number from {MIN_ANIM_SECONDS:g} to "
+                              f"{MAX_ANIM_SECONDS:g} seconds")
+            else:
+                spec[key] = float(value)
+        elif key == "stagger":
+            if not _is_number(value) or not 0 <= value <= MAX_STAGGER_SECONDS:
+                errors.append(f"{label}.stagger: must be a number from 0 to {MAX_STAGGER_SECONDS:g} seconds")
+            else:
+                spec[key] = float(value)
+    return spec
+
+
+def resolve_animation(card_spec: dict | None, default: dict | None) -> tuple | None:
+    """Combine the project default with a card's own animation. Returns
+    (in, out, duration, stagger) or None when the card does not animate."""
+    merged = {**(default or {}), **(card_spec or {})}
+    kind_in, kind_out = merged.get("in", "none"), merged.get("out", "none")
+    if kind_in == "none" and kind_out == "none":
+        return None
+    return (kind_in, kind_out, merged.get("duration", DEFAULT_ANIM_SECONDS), merged.get("stagger", 0.0))
+
+
 def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCard, ...]:
     if raw is None:
         return ()
@@ -268,7 +323,7 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("text", "style", "start", "end", "kind", "label", "value", "source"):
+            if key not in ("text", "style", "start", "end", "kind", "label", "value", "source", "animation"):
                 errors.append(f"{name}: unknown field: {key}")
         kind = item.get("kind", "plain")
         if kind not in CARD_KINDS:
@@ -315,7 +370,9 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
         if not _is_number(end) or end <= start:
             errors.append(f"{name}.end: must be a number of seconds after start")
             end = float(start) + 1.0
-        cards.append(TextCard(text, style, float(start), float(end), kind, label, value, source))
+        animation = parse_animation(item.get("animation"), f"{name}.animation", errors)
+        cards.append(TextCard(text, style, float(start), float(end), kind, label, value, source,
+                              animation or None))
     return tuple(cards)
 
 
@@ -538,7 +595,7 @@ class Part:
 
 @dataclass(frozen=True)
 class Block:
-    lines: list  # (text, size, color, y) in drawing order
+    lines: list  # (text, size, color, y, part index) in drawing order
     x: int | None  # left edge of the text, None = centred
     panel: tuple | None  # (x, y, w, h) or None
     bar: tuple | None = None  # (x, y, w, h) of the accent bar, inside the panel, or None
@@ -623,7 +680,7 @@ def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Blo
         if index:
             y += gap
         for text in wrapped:
-            lines.append((text, size, color, y))
+            lines.append((text, size, color, y, index))
             y += height_of_line + spacing
         y -= spacing
     x = panel_x + pad_x + extra_left + outline if left else None
@@ -657,10 +714,13 @@ def card_parts(card: TextCard, style: dict, width: int = 1080, height: int = 192
     return parts
 
 
-def card_items(card: TextCard, style: dict, width: int, height: int) -> list:
-    """Overlay items (DrawBox and DrawLine) for one text card."""
+def card_items(card: TextCard, style: dict, width: int, height: int,
+               animation: tuple | None = None) -> list:
+    """Overlay items (DrawBox and DrawLine) for one text card. ``animation`` is the resolved
+    (in, out, duration, stagger) or None; the panel and the bar cut in and out, the text lines
+    animate (each part starts ``stagger`` seconds after the one above it)."""
     plain = card.kind == "plain"
-    if plain and style["align"] == "center" and not style["panel"]:
+    if plain and style["align"] == "center" and not style["panel"] and animation is None:
         # The original path, untouched: same lines, same keys, same output.
         return _draw_lines(card.text, style, card.start, card.end, width, height)
     block = layout_parts(card_parts(card, style, width, height), style, width, height)
@@ -672,16 +732,27 @@ def card_items(card: TextCard, style: dict, width: int, height: int) -> list:
     if block.bar is not None:
         bx, by, bw, bh = block.bar
         items.append(DrawBox(bx, by, bw, bh, style["accent_color"], 1.0, card.start, card.end))
-    for text, size, color, y in block.lines:
+    window = card.end - card.start
+    for text, size, color, y, part in block.lines:
+        anim = None
+        if animation is not None:
+            kind_in, kind_out, seconds, stagger = animation
+            delay = part * stagger
+            need = delay + (seconds if kind_in != "none" else 0) + (seconds if kind_out != "none" else 0)
+            if need > window + 1e-6:
+                raise TextLayoutError(
+                    f"the card animation needs {need:.2f}s (in, out and stagger) but the card is on screen "
+                    f"for {window:.2f}s: {card.text[:30] or card.value[:30]!r}")
+            anim = (kind_in, kind_out, seconds, delay)
         items.append(DrawLine(text, style["font"], size, color, style["outline_color"],
                               style["outline_width"], y, style["box"], style["box_color"],
-                              style["box_opacity"], card.start, card.end, block.x))
+                              style["box_opacity"], card.start, card.end, block.x, anim))
     return items
 
 
 def scene_overlays(narration: str, audio_duration: float, caption: dict,
                    cards: tuple[TextCard, ...], card_defaults: dict, width: int,
-                   height: int) -> list[DrawLine]:
+                   height: int, animation_default: dict | None = None) -> list[DrawLine]:
     """Every line of text to burn into one scene, with its on-screen window."""
     items: list[DrawLine] = []
     if caption.get("enabled"):
@@ -691,7 +762,8 @@ def scene_overlays(narration: str, audio_duration: float, caption: dict,
                 items.extend(_draw_lines(cue.text, style, cue.start, cue.end, width, height))
     for card in cards:
         style = resolve_style("card", width, height, card_defaults, KIND_DEFAULTS[card.kind], card.style)
-        items.extend(card_items(card, style, width, height))
+        items.extend(card_items(card, style, width, height,
+                                resolve_animation(card.animation, animation_default)))
     return items
 
 
@@ -713,8 +785,10 @@ def overlay_key(items: list[DrawLine]) -> list:
             continue
         row = [i.text, i.font, i.size, i.color, i.outline_color, i.outline_width, i.y, i.box,
                i.box_color, i.box_opacity, i.start, i.end]
-        if i.x is not None:
+        if i.x is not None or i.anim is not None:
             row.append(i.x)
+        if i.anim is not None:
+            row.append(["anim", *i.anim])
         rows.append(row)
     return [rows, sorted(fonts.items())]
 
@@ -723,6 +797,42 @@ def overlay_key(items: list[DrawLine]) -> list:
 
 def _ffmpeg_color(value: str) -> str:
     return "0x" + value[1:].upper()
+
+
+def _progress(item: DrawLine) -> str:
+    """0 to 1 over the entrance of an animated line (cubic ease-out is applied by the caller)."""
+    _, _, seconds, delay = item.anim
+    return f"clip((t-{item.start + delay:.3f})/{seconds:g},0,1)"
+
+
+def _slide_offset(item: DrawLine) -> str:
+    return f"{round(item.size * SLIDE_DISTANCE)}*pow(1-{_progress(item)},3)"
+
+
+def _x_expression(item: DrawLine) -> str:
+    base = "(w-text_w)/2" if item.x is None else str(item.x)
+    if item.anim is not None and item.anim[0] == "slide_left":
+        return f"x='{base}-{_slide_offset(item)}'"
+    return f"x={base}"
+
+
+def _y_expression(item: DrawLine) -> str:
+    if item.anim is not None and item.anim[0] == "slide_up":
+        return f"y='{item.y}+{_slide_offset(item)}'"
+    return f"y={item.y}"
+
+
+def _alpha_expression(item: DrawLine) -> str:
+    """Fade in with the entrance and fade out before the end; empty for static lines."""
+    if item.anim is None:
+        return ""
+    kind_in, kind_out, seconds, _ = item.anim
+    parts = []
+    if kind_in != "none":
+        parts.append(_progress(item))
+    if kind_out == "fade":
+        parts.append(f"clip(({item.end:.3f}-t)/{seconds:g},0,1)")
+    return "*".join(parts)
 
 
 def drawtext_chain(items: list[DrawLine], prefix: str) -> Chain:
@@ -755,10 +865,13 @@ def drawtext_chain(items: list[DrawLine], prefix: str) -> Chain:
             f"fontcolor={_ffmpeg_color(item.color)}",
             f"borderw={item.outline_width:g}",
             f"bordercolor={_ffmpeg_color(item.outline_color)}",
-            "x=(w-text_w)/2" if item.x is None else f"x={item.x}",
-            f"y={item.y}",
+            _x_expression(item),
+            _y_expression(item),
             f"enable='gte(t,{item.start:.3f})*lt(t,{item.end:.3f})'",
         ]
+        alpha = _alpha_expression(item)
+        if alpha:
+            parts.append(f"alpha='{alpha}'")
         if item.box:
             parts += [
                 "box=1",

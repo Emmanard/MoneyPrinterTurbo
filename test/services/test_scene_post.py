@@ -1799,3 +1799,151 @@ def test_plan_shows_look_and_flash(project, capsys):
     assert sp.main(["--project", str(project), "plan", "--text"]) == 0
     text = capsys.readouterr().out
     assert "look: eq=contrast=1.04" in text and "flash: 0.1 s, strength 0.8, #FFFFFF" in text
+
+
+# -- E4: card animation in real frames --------------------------------------------------
+
+def _anim_scene(card, animation, **extra):
+    card = {"start": 0.2, "end": 1.2, **card, "animation": animation}
+    card["style"] = {"position": "center", **card.get("style", {})}
+    return _scene("s1", audio="three.wav", asset=_flat_name, motion="static", text_cards=[card], **extra)
+
+
+_flat_name = "flat.png"
+
+
+def _text_rows(project):
+    """Bounding box (x0, y0, x1, y1) of the drawn text lines of the first card."""
+    manifest = sp.load_manifest(project)
+    card = manifest.scenes[0].text_cards[0]
+    style = _claim_style(manifest, card)
+    animation = scene_post.scene_text.resolve_animation(card.animation, manifest.text_card_animation)
+    items = scene_post.scene_text.card_items(card, style, 270, 480, animation)
+    lines = [i for i in items if isinstance(i, scene_post.scene_text.DrawLine)]
+    return [(i.y, i.size, i.text) for i in lines]
+
+
+def _bright(image, box, level=150):
+    crop = image.convert("L").crop(box)
+    return sum(1 for p in crop.getdata() if p > level)
+
+
+def _frames(project, out, times):
+    return {t: Image.open(_frame(out, t, project / f"fr_{t}.png")) for t in times}
+
+
+def test_fade_in_shows_the_text_gradually_over_a_static_panel(project):
+    _flat(project, "flat.png", "0x303030")
+    claim = {"kind": "claim", "label": "Page Six", "text": "Hit his head"}
+    _write(project, [_anim_scene(claim, {"in": "fade", "duration": 0.6})])
+    rows = _text_rows(project)
+    panel = _card_rect(project)
+    out = _build(project)["output"]
+    frames = _frames(project, out, [0.2, 0.4, 0.9])
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+    # the panel is already there when the card starts (it cuts in) but the text is not
+    start, mid, end = (_bright(frames[t], box, 60) for t in (0.2, 0.4, 0.9))
+    assert _luma(frames[0.2], box) < 0.6 * 0x30     # dark panel at the first frame
+    assert start <= 5 and start < mid < end
+
+
+def test_fade_out_removes_the_text_before_the_card_ends(project):
+    _flat(project, "flat.png", "0x303030")
+    claim = {"kind": "claim", "label": "Page Six", "text": "Hit his head"}
+    _write(project, [_anim_scene(claim, {"out": "fade", "duration": 0.6})])
+    panel = _card_rect(project)
+    out = _build(project)["output"]
+    frames = _frames(project, out, [0.4, 1.1])
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+    assert _bright(frames[1.1], box) < _bright(frames[0.4], box) * 0.5
+
+
+def test_slide_up_moves_the_text_up_into_place(project):
+    _flat(project, "flat.png", "0x303030")
+    claim = {"kind": "claim", "label": "Page Six", "text": "Hit his head", "style": {"align": "center"}}
+    _write(project, [_anim_scene(claim, {"in": "slide_up", "duration": 0.8})])
+    panel = _card_rect(project)
+    out = _build(project)["output"]
+    frames = _frames(project, out, [0.4, 1.1])
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+
+    def centroid(image):
+        crop = image.convert("L").crop(box)
+        w = crop.size[0]
+        ys = [i // w for i, p in enumerate(crop.getdata()) if p > 45]
+        return sum(ys) / len(ys) if ys else None
+
+    early, final = centroid(frames[0.4]), centroid(frames[1.1])
+    assert early is not None and final is not None and early > final + 1.5
+
+
+def test_stagger_lets_the_label_land_before_the_claim(project):
+    _flat(project, "flat.png", "0x303030")
+    claim = {"kind": "claim", "label": "Page Six", "text": "Hit his head"}
+    _write(project, [_anim_scene(claim, {"in": "fade", "duration": 0.2, "stagger": 0.5})])
+    rows = _text_rows(project)
+    out = _build(project)["output"]
+    frame = _frames(project, out, [0.5])[0.5]
+    label_y, label_size, _ = rows[0]
+    claim_y, claim_size, _ = rows[1]
+    panel = _card_rect(project)
+    label_box = (panel.x, label_y, panel.x + panel.w, label_y + label_size)
+    claim_box = (panel.x, claim_y, panel.x + panel.w, claim_y + claim_size)
+    assert _bright(frame, label_box, 100) > 5          # the label is already there (accent colour is bright)
+    assert _bright(frame, claim_box, 150) <= 2         # the claim has not started
+    late = _frames(project, out, [1.0])[1.0]
+    assert _bright(late, claim_box, 150) > 5
+
+
+def test_probe_box_behaviour_of_a_plain_card_with_a_fade(project):
+    _flat(project, "flat.png", "0x909090")
+    _write(project, [_anim_scene({"text": "Plain card"}, {"in": "fade", "duration": 0.6})])
+    rows = _text_rows(project)
+    out = _build(project)["output"]
+    frames = _frames(project, out, [0.2, 1.0])
+    y, size, _ = rows[0]
+    box = (40, y, 230, y + size)
+    print("BOXPROBE start", _luma(frames[0.2], box), "end", _luma(frames[1.0], box), "bg", 0x90)
+
+
+def test_an_animation_that_does_not_fit_is_rejected_before_rendering(project):
+    _flat(project, "flat.png")
+    _write(project, [_anim_scene({"text": "Short"}, {"in": "fade", "out": "fade", "duration": 0.7})])
+    with pytest.raises(sp.PipelineError, match="animation needs"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_animation_default_in_settings_applies_and_a_card_can_turn_it_off(project):
+    _flat(project, "flat.png")
+    card = {"text": "Plain card", "start": 0.2, "end": 1.2}
+    scenes = [_scene("s1", audio="three.wav", asset="flat.png", motion="static", text_cards=[card])]
+    manifest = {"schema_version": 1, "project_id": "ep", "scenes": scenes,
+                "settings": {**SETTINGS, "text_card_animation": {"in": "fade", "duration": 0.3}}}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = sp.load_manifest(project)
+    assert loaded.text_card_animation == {"in": "fade", "duration": 0.3}
+    items = scene_post._overlays(loaded, loaded.scenes[0], 1.3)
+    assert all(i.anim == ("fade", "none", 0.3, 0.0) for i in items)
+    scenes[0]["text_cards"][0]["animation"] = {"in": "none"}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = sp.load_manifest(project)
+    assert all(i.anim is None for i in scene_post._overlays(loaded, loaded.scenes[0], 1.3))
+
+
+def test_changing_an_animation_rebuilds_only_that_scene(project):
+    _flat(project, "flat.png")
+    scenes = [_anim_scene({"text": "Plain card"}, {"in": "fade", "duration": 0.3}), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[0]["text_cards"][0]["animation"] = {"in": "slide_up", "duration": 0.3}
+    _write(project, scenes)
+    rebuilt = _rebuilt(_build(project))
+    assert "s1:picture" in rebuilt and "s2:picture" not in rebuilt
+
+
+def test_plan_shows_the_animation(project, capsys):
+    _flat(project, "flat.png")
+    _write(project, [_anim_scene({"kind": "claim", "label": "L", "text": "Text"}, {"in": "slide_up", "stagger": 0.2})])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    assert "animation in=slide_up out=none 0.3s stagger 0.2s" in capsys.readouterr().out

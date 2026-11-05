@@ -286,3 +286,14 @@ the flash is a solid colour overlay with an alpha envelope (`fade ... alpha=1`) 
 `eq` brightness pulse, because that supports a flash colour and was checked in the container
 before use; the vignette angle grows with `amount` (a larger lens angle darkens more, measured
 in the container; my first guess had the direction reversed and a test caught it).
+
+**E4 card animation (built):** `animation {in, out, duration, stagger}` per card and
+`settings.text_card_animation` as the project default. Entrances: `fade`, `slide_up`,
+`slide_left`; exit: `fade`; `stagger` delays each part (label, then claim) by a fixed step. The
+panel and bar cut in and out (decided in the review); text lines animate with `drawtext`
+expressions of `t` (alpha, and y or x for the slides). Changes from the proposal: `pop` and
+`typewriter` are not built (the request named slide and fade entrances; typewriter was skipped in
+the review), and `slide_left` was added because left-aligned claim and quote cards enter
+naturally from the left. A probe showed that a plain card's per-line box fades with the text,
+since `alpha` applies to the box in this ffmpeg; the proposal flagged this as unverified. The
+animation is part of each line's overlay key only when set, so static cards keep their keys.

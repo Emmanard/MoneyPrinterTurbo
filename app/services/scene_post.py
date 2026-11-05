@@ -173,7 +173,7 @@ def _overlays(manifest: SceneManifest, scene, duration: float) -> list:
     caption = scene_text.merge_caption(manifest.captions, scene.captions)
     return scene_text.scene_overlays(
         scene.narration, duration, caption, scene.text_cards, manifest.text_card_style,
-        manifest.settings.width, manifest.settings.height,
+        manifest.settings.width, manifest.settings.height, manifest.text_card_animation,
     )
 
 

@@ -99,9 +99,13 @@ def _card_rows(manifest: sp.SceneManifest, scene: sp.Scene, length: float | None
             if getattr(card, field):
                 row[field] = getattr(card, field)
         try:
-            drawn = [i for i in scene_text.card_items(card, style, width, height)
+            animation = scene_text.resolve_animation(card.animation, manifest.text_card_animation)
+            drawn = [i for i in scene_text.card_items(card, style, width, height, animation)
                      if isinstance(i, scene_text.DrawLine)]
             size = max(i.size for i in drawn)
+            if animation is not None:
+                row["animation"] = {"in": animation[0], "out": animation[1], "duration": animation[2],
+                                    "stagger": animation[3]}
             row.update(lines=len(drawn), size=size, align=style["align"], panel=style["panel"],
                        shrunk_from=style["size"] if size < style["size"] else None)
         except scene_text.TextLayoutError as exc:
@@ -269,6 +273,9 @@ def format_text(plan: dict) -> str:
                 shown = f"{shown} -- {c['source']}"
             if kind != "plain":
                 detail += f", {kind}"
+            if c.get("animation"):
+                a = c["animation"]
+                detail += f", animation in={a['in']} out={a['out']} {a['duration']:g}s stagger {a['stagger']:g}s"
             lines.append(f"  card {c['index']}: {window} [{detail}] {shown}")
         if e.get("look"):
             lines.append(f"  look: {e['look']}")
