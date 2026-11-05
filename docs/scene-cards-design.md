@@ -297,3 +297,13 @@ the review), and `slide_left` was added because left-aligned claim and quote car
 naturally from the left. A probe showed that a plain card's per-line box fades with the text,
 since `alpha` applies to the box in this ffmpeg; the proposal flagged this as unverified. The
 animation is part of each line's overlay key only when set, so static cards keep their keys.
+
+**E5 camera easing (built):** `camera {from, to, ease}` on a scene or an `assets[]` entry, an
+alternative to `motion` (never both), images only. The pure parts are in the new
+`app/services/scene_camera.py`; the zoom filters in `scene_pipeline` accept a camera wherever
+they accepted a preset name, so the presets keep their exact filter strings and the single-image
+legacy path is untouched. Changes from the proposal: the clip key version stays `aclip-v1`
+(the proposal bumped it) because a camera adds a structured element to the key only when set,
+and old manifests must keep their keys; the x and y expressions use the zoom expression
+directly instead of the `zoompan` `zoom` variable, which lags one frame; `to` fields missing
+from the camera inherit `from`.

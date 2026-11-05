@@ -46,6 +46,10 @@ def audio_lengths(project: Path, manifest: sp.SceneManifest, path: Path) -> tupl
         return raw, sp.probe_audio(trimmed)
 
 
+def _motion_text(motion) -> str:
+    return motion.describe() if hasattr(motion, "describe") else motion
+
+
 def _asset_rows(manifest: sp.SceneManifest, scene: sp.Scene, infos: dict, duration: float | None,
                 problems: list[str]) -> list[dict]:
     fps = manifest.settings.fps
@@ -67,7 +71,7 @@ def _asset_rows(manifest: sp.SceneManifest, scene: sp.Scene, infos: dict, durati
             "kind": info.kind,
             "pixels": f"{info.width}x{info.height}",
             "fit": ref.fit or scene.fit,
-            "motion": (ref.motion or scene.motion) if info.kind == "image" else None,
+            "motion": (_motion_text(sp.effective_motion(ref, scene)) if info.kind == "image" else None),
             "duration_given": ref.duration,
         }
         if seconds is not None and counts is not None:

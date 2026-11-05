@@ -1947,3 +1947,177 @@ def test_plan_shows_the_animation(project, capsys):
     _write(project, [_anim_scene({"kind": "claim", "label": "L", "text": "Text"}, {"in": "slide_up", "stagger": 0.2})])
     assert sp.main(["--project", str(project), "plan", "--text"]) == 0
     assert "animation in=slide_up out=none 0.3s stagger 0.2s" in capsys.readouterr().out
+
+
+# -- E5: camera with easing -------------------------------------------------------------
+
+from app.services import scene_camera  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,message", [
+    ("zoom", "camera: must be an object"),
+    ({"from": {"zoom": 1.2}}, "camera.to: required"),
+    ({"to": {"zoom": 1.2}, "speed": 2}, "camera: unknown field: speed"),
+    ({"to": {"zoom": 3.5}}, "camera.to.zoom: must be a number from 1 to 3"),
+    ({"to": {"zoom": 0.9}}, "camera.to.zoom: must be a number from 1 to 3"),
+    ({"to": {"x": 1.2}}, "camera.to.x: must be a number from 0 to 1"),
+    ({"to": {"y": -0.1}}, "camera.to.y: must be a number from 0 to 1"),
+    ({"to": {"pan": 1}}, "camera.to: unknown field: pan"),
+    ({"to": 2}, "camera.to: must be an object"),
+    ({"from": {"zoom": "big"}, "to": {"zoom": 1.2}}, "camera.from.zoom: must be a number from 1 to 3"),
+    ({"to": {"zoom": 1.2}, "ease": "bounce"}, "camera.ease: must be one of linear, ease_in, ease_out, ease_in_out"),
+])
+def test_camera_is_validated(raw, message):
+    errors = []
+    scene_camera.parse_camera(raw, "camera", errors)
+    assert any(message in e for e in errors), errors
+
+
+def test_camera_defaults_and_inheritance():
+    camera = scene_camera.parse_camera({"to": {"zoom": 1.5}}, "camera", [])
+    assert camera == scene_camera.Camera(1.0, 0.5, 0.5, 1.5, 0.5, 0.5, "ease_in_out")
+    camera = scene_camera.parse_camera({"from": {"zoom": 1.2, "x": 0.3}, "to": {"y": 0.7}, "ease": "linear"}, "camera", [])
+    assert camera == scene_camera.Camera(1.2, 0.3, 0.5, 1.2, 0.3, 0.7, "linear")
+    assert scene_camera.parse_camera(None, "camera", []) is None
+
+
+@pytest.mark.parametrize("ease,expected", [
+    ("linear", "on/10"),
+    ("ease_in", "(on/10)*(on/10)"),
+    ("ease_out", "(1-(1-(on/10))*(1-(on/10)))"),
+    ("ease_in_out", "(0.5-0.5*cos(PI*(on/10)))"),
+])
+def test_camera_easing_expressions(ease, expected):
+    assert scene_camera.ease_expression(ease, "on/10") == expected
+    camera = scene_camera.Camera(1.0, 0.5, 0.5, 1.3, 0.4, 0.45, ease)
+    z, x, y = scene_camera.camera_expressions(camera, 10)
+    assert z.startswith("1.000000+(0.300000)*") and expected in z
+    assert x.startswith("max(0,min(iw-iw/(") and ")*iw-iw/(" in x and y.startswith("max(0,min(ih-ih/(")
+
+
+def test_camera_and_motion_are_exclusive_and_not_for_videos(project):
+    scene = _scene("s1", motion="pan_left", camera={"to": {"zoom": 1.2}})
+    _write(project, [scene])
+    assert "scene s1: set either motion or camera, not both" in _errors(project)
+    entry = {"id": "s1", "narration": SAY, "audio": "one.wav",
+             "assets": [{"file": "a.png", "motion": "zoom_out", "camera": {"to": {"zoom": 1.2}}},
+                        {"file": "clip.mp4", "camera": {"to": {"zoom": 1.2}}}]}
+    _write(project, [entry])
+    message = _errors(project)
+    assert "assets[0]: set either motion or camera, not both" in message
+    assert "assets[1].camera: only applies to images; videos are not zoomed" in message
+    _write(project, [_scene("s1", asset="clip.mp4", camera={"to": {"zoom": 1.2}})])
+    assert "camera: only applies to images; videos are not zoomed" in _errors(project)
+
+
+def test_presets_still_use_the_original_filter_strings_and_path(project):
+    _write(project, [_scene("s1", motion="zoom_in")])
+    manifest = sp.load_manifest(project)
+    info = sp.inspect_media(manifest, project)["a.png"]
+    assert sp.legacy_visual(manifest.scenes[0], info)
+    assert sp._zoompan_motion("zoom_in", 0.04, 20)[0] == "1+0.040000*on/20"
+    _write(project, [_scene("s1", camera={"to": {"zoom": 1.2}})])
+    manifest = sp.load_manifest(project)
+    assert not sp.legacy_visual(manifest.scenes[0], sp.inspect_media(manifest, project)["a.png"])
+
+
+def _zoom_in_image(project, camera, ease_frames=None, **extra):
+    return _scene("s1", audio="three.wav", asset="b.png", camera=camera, **extra)
+
+
+def _centre_zoom(first_png, other_png):
+    """Zoom factor (1 to 2) that best maps the first frame onto another around the centre."""
+    import numpy as np
+
+    size = (135, 240)
+    with Image.open(first_png) as a, Image.open(other_png) as b:
+        first = a.convert("L").resize(size, Image.BILINEAR)
+        target = np.asarray(b.convert("L").resize(size, Image.BILINEAR), dtype=np.float32)
+    best = None
+    for scale in np.arange(1.0, 2.01, 0.01):
+        inverse = 1.0 / scale
+        data = (inverse, 0, 0.5 * size[0] * (1 - inverse), 0, inverse, 0.5 * size[1] * (1 - inverse))
+        warped = np.asarray(first.transform(size, Image.AFFINE, data, Image.BILINEAR), dtype=np.float32)
+        error = float(np.mean((warped - target) ** 2))
+        if best is None or error < best[0]:
+            best = (error, float(scale))
+    return best[1]
+
+
+def test_a_camera_zooms_from_the_start_to_the_end_state(project, tmp_path):
+    _write(project, [_scene("s1", audio="three.wav", asset="b.png",
+                            camera={"from": {"zoom": 1.0}, "to": {"zoom": 1.5}, "ease": "linear"})])
+    out = _build(project)["output"]
+    first = _frame(out, 0.0, tmp_path / "first.png")
+    last = _frame(out, 1.2, tmp_path / "last.png")
+    middle = _frame(out, 0.6, tmp_path / "middle.png")
+    clip_frames = 13 + sp.CLIP_MARGIN_FRAMES
+    zoom_end = _centre_zoom(first, last)
+    zoom_mid = _centre_zoom(first, middle)
+    assert zoom_end == pytest.approx(1 + 0.5 * 12 / clip_frames, abs=0.06)
+    assert zoom_mid == pytest.approx(1 + 0.5 * 6 / clip_frames, abs=0.06)
+    assert zoom_mid < zoom_end
+
+
+def test_ease_in_out_is_slower_at_the_ends_than_linear(project, tmp_path):
+    results = {}
+    for ease in ("linear", "ease_in_out"):
+        _write(project, [_scene("s1", audio="three.wav", asset="b.png",
+                                camera={"to": {"zoom": 1.6}, "ease": ease})])
+        out = _build(project)["output"]
+        first = _frame(out, 0.0, tmp_path / f"{ease}_f.png")
+        early = _frame(out, 0.3, tmp_path / f"{ease}_e.png")
+        results[ease] = _centre_zoom(first, early)
+    assert results["ease_in_out"] < results["linear"] - 0.03
+
+
+def test_the_camera_window_stays_inside_the_picture(project, tmp_path):
+    _write(project, [_scene("s1", audio="three.wav", asset="b.png",
+                            camera={"from": {"zoom": 2.0, "x": 0.0, "y": 0.0}, "to": {"zoom": 2.0, "x": 0.0, "y": 0.0}})])
+    out = _build(project)["output"]
+    frame = Image.open(_frame(out, 0.5, tmp_path / "corner.png")).convert("L")
+    assert max(frame.getdata()) > 0
+    # pushed against the top-left corner of the picture: the top-left of the frame is the
+    # top-left of the source, which in smptebars is the grey bar
+    reference = Image.open(project / "assets" / "b.png").convert("L")
+    assert abs(frame.getpixel((2, 2)) - reference.getpixel((1, 1))) < 40
+
+
+def test_a_camera_works_with_contain_blur_and_per_asset(project):
+    _write(project, [{"id": "s1", "narration": SAY, "audio": "three.wav", "fit": "contain_blur",
+                      "assets": [{"file": "wide.png", "duration": 0.6, "camera": {"to": {"zoom": 1.4}}},
+                                 {"file": "a.png", "motion": "pan_left"}]}])
+    result = _build(project)
+    assert abs(_duration(result["output"]) - 1.3) < 0.15
+
+
+def test_a_scene_camera_is_the_default_for_its_assets_and_an_asset_can_override(project):
+    _write(project, [{"id": "s1", "narration": SAY, "audio": "three.wav", "camera": {"to": {"zoom": 1.3}},
+                      "assets": [{"file": "a.png", "duration": 0.6},
+                                 {"file": "b.png", "motion": "static"},
+                                 {"file": "wide.png", "camera": {"to": {"zoom": 2.0}}}]}])
+    scene = sp.load_manifest(project).scenes[0]
+    refs = scene.assets
+    assert sp.effective_motion(refs[0], scene) == scene.camera
+    assert sp.effective_motion(refs[1], scene) == "static"
+    assert sp.effective_motion(refs[2], scene) == refs[2].camera != scene.camera
+
+
+def test_changing_a_camera_rebuilds_only_that_scene_and_motions_keep_their_clip_keys(project):
+    scenes = [_scene("s1", audio="three.wav", asset="b.png", camera={"to": {"zoom": 1.3}}),
+              _scene("s2", "two.wav", "a.png")]
+    _write(project, scenes)
+    first = _build(project)
+    scenes[0]["camera"] = {"to": {"zoom": 1.5}}
+    _write(project, scenes)
+    second = _build(project)
+    assert second["image_clips_rendered"] == 1
+    assert second["stages"]["s2:scene"] is True        # the plain scene was not re-rendered
+    assert first["stages"]["s2:scene"] is False
+
+
+def test_plan_describes_the_camera(project, capsys):
+    _write(project, [_scene("s1", audio="three.wav", asset="b.png",
+                            camera={"from": {"zoom": 1.0}, "to": {"zoom": 1.3, "x": 0.4}, "ease": "ease_out"})])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    assert "camera zoom 1->1.3, focus (0.5,0.5)->(0.4,0.5), ease_out" in capsys.readouterr().out

@@ -112,8 +112,9 @@ to anything other than null is an error.
 | `narration` | used | Text to speak; required unless `audio` is set. Also the caption text |
 | `audio` | used | Optional filename in `audio/`; skips TTS |
 | `asset` | used | Filename in `assets/` (image or video). Use this or `assets` |
-| `assets` | used | List of `{file, start, duration, motion, fit}`; replaces `asset` |
+| `assets` | used | List of `{file, start, duration, motion, fit, camera}`; replaces `asset` |
 | `motion` | used | `zoom_in` (default), `zoom_out`, `pan_left`, `pan_right`, `pan_up`, `pan_down`, `static`; images only |
+| `camera` | used | An eased zoom and pan for an image, instead of `motion` (see Camera). Set `motion` or `camera`, never both |
 | `fit` | used | `cover` (default) fills the frame and crops; `contain_blur` shows the whole picture over a blurred copy of itself |
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
 | `volume_db` | used | Gain for this scene's narration in dB, -30 to 12, default 0. Applied in the post stages, separately from `settings.narration_volume`; only that scene's narration segments (and its junctions) rebuild |
@@ -446,6 +447,32 @@ graphics. Narration still crossfades with equal power for every type.
 - Warnings are added to the build result when the output is more than 1 LU from the
   target or the true peak is more than 0.3 dB over the limit after the AAC encode.
 - Silent audio cannot be measured and fails the build with a clear message.
+
+### Camera
+
+An eased zoom and pan for a still image, as an alternative to a `motion` preset. Optional; the
+presets and every manifest without a camera render exactly as before.
+
+```json
+"camera": {
+  "from": {"zoom": 1.0, "x": 0.5, "y": 0.5},
+  "to":   {"zoom": 1.25, "x": 0.35, "y": 0.4},
+  "ease": "ease_in_out"
+}
+```
+
+- `zoom`: 1 to 3 (1 shows the whole picture). `x`, `y`: where the centre of the visible window
+  sits, 0 to 1 of the picture; the window is clamped so it never leaves the picture.
+- `to` is required. `from` defaults to the whole picture, centred; fields left out of `to` stay
+  as in `from`. `ease`: `linear`, `ease_in`, `ease_out`, `ease_in_out` (default).
+- A camera can go on a scene or on an `assets[]` entry. On an entry it wins; an entry with
+  `motion` uses that instead; an entry with neither uses the scene's camera or motion. A scene
+  or entry cannot have both `motion` and `camera`.
+- Images only: a camera on a video is rejected (videos are not zoomed). It works with
+  `contain_blur` (it moves the contained picture inside its box).
+- It uses the same `zoompan` render as the presets, so memory is unchanged. For 1080 wide
+  graphics keep the zoom under about 1.5; higher values soften the picture. Changing a camera
+  re-renders only that clip.
 
 ### Look
 

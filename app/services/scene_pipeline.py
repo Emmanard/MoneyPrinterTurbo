@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
-from app.services import scene_look, scene_text
+from app.services import scene_camera, scene_look, scene_text
 from app.services.video_project import (
     _ID,
     ProjectError,
@@ -73,7 +73,7 @@ RESERVED_SCENE_FIELDS: tuple[str, ...] = ()
 USED_TOP_LEVEL = frozenset({"schema_version", "project_id", "voice", "settings", "bgm", "scenes"})
 USED_SCENE_FIELDS = frozenset({
     "id", "narration", "asset", "assets", "audio", "motion", "fit", "pause_after",
-    "captions", "text_cards", "transition", "volume_db", "look",
+    "captions", "text_cards", "transition", "volume_db", "look", "camera",
 })
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
@@ -147,6 +147,7 @@ class AssetRef:
     duration: float | None = None
     motion: str | None = None
     fit: str | None = None  # None = use the scene's fit
+    camera: scene_camera.Camera | None = None  # an eased zoom and pan, instead of motion
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,7 @@ class Scene:
     transition: Transition | None = None
     volume_db: float = 0.0
     look: dict | None = None
+    camera: scene_camera.Camera | None = None
 
 
 @dataclass(frozen=True)
@@ -388,6 +390,10 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
         for key in RESERVED_SCENE_FIELDS:
             if item.get(key) is not None:
                 errors.append(f"{label}: {_reserved(key)}")
+        camera = scene_camera.parse_camera(item.get("camera"), f"{label}.camera", errors)
+        if camera is not None and "motion" in item:
+            errors.append(f"{label}: set either motion or camera, not both")
+            camera = None
         motion = item.get("motion", "zoom_in")
         if motion in RESERVED_MOTIONS:
             errors.append(f"{label}: {_reserved('motion ' + repr(motion))}")
@@ -403,6 +409,9 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
             errors.append(f"{label}.narration: must be text under 100000 characters")
             narration = ""
         asset = item.get("asset")
+        if camera is not None and isinstance(asset, str) and Path(asset).suffix.lower() in VIDEO_EXTENSIONS:
+            errors.append(f"{label}.camera: only applies to images; videos are not zoomed")
+            camera = None
         assets: tuple[AssetRef, ...] = ()
         if item.get("assets") is not None and asset is not None:
             errors.append(f"{label}: set either asset or assets, not both")
@@ -450,6 +459,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
                 pause_after=float(pause_after),
                 volume_db=float(volume_db),
                 look=look or None,
+                camera=camera,
                 captions=captions,
                 text_cards=cards,
                 transition=transition,
@@ -479,7 +489,7 @@ def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> t
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("file", "start", "duration", "motion", "fit"):
+            if key not in ("file", "start", "duration", "motion", "fit", "camera"):
                 errors.append(f"{name}: unknown field: {key}")
         file = item.get("file")
         _plain_filename(file, f"{name}.file", IMAGE_EXTENSIONS | VIDEO_EXTENSIONS, folder, errors)
@@ -501,8 +511,15 @@ def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> t
         if fit is not None and fit not in FITS:
             errors.append(f"{name}.fit: must be one of {', '.join(FITS)}")
             fit = None
+        camera = scene_camera.parse_camera(item.get("camera"), f"{name}.camera", errors)
+        if camera is not None and "motion" in item:
+            errors.append(f"{name}: set either motion or camera, not both")
+            camera = None
+        if camera is not None and isinstance(file, str) and Path(file).suffix.lower() in VIDEO_EXTENSIONS:
+            errors.append(f"{name}.camera: only applies to images; videos are not zoomed")
+            camera = None
         refs.append(AssetRef(file if isinstance(file, str) else "", float(start),
-                             None if duration is None else float(duration), motion, fit))
+                             None if duration is None else float(duration), motion, fit, camera))
     return tuple(refs)
 
 
@@ -984,8 +1001,11 @@ def build_zoom_filter(width: int, height: int, fps: int, frames: int, motion: st
 PAN_MIN_ZOOM = 0.10
 
 
-def _zoompan_motion(motion: str, total: float, frames: int) -> tuple[str, str, str]:
-    """(z, x, y) expressions for ffmpeg zoompan. ``on`` is the output frame number."""
+def _zoompan_motion(motion, total: float, frames: int) -> tuple[str, str, str]:
+    """(z, x, y) expressions for ffmpeg zoompan. ``on`` is the output frame number. ``motion``
+    is a preset name or a scene_camera.Camera."""
+    if isinstance(motion, scene_camera.Camera):
+        return scene_camera.camera_expressions(motion, frames)
     center_x = "iw/2-(iw/zoom/2)"
     center_y = "ih/2-(ih/zoom/2)"
     if motion == "zoom_in":
@@ -1090,8 +1110,19 @@ def legacy_visual(scene: Scene, info: MediaInfo) -> bool:
     return (
         not scene.assets
         and scene.fit == "cover"
+        and scene.camera is None
         and (info.kind == "video" or scene.motion in ("zoom_in", "static"))
     )
+
+
+def effective_motion(ref: AssetRef, scene: Scene):
+    """What moves one visual: its own camera, its own motion, the scene's camera, or the
+    scene's motion, in that order."""
+    if ref.camera is not None:
+        return ref.camera
+    if ref.motion:
+        return ref.motion
+    return scene.camera if scene.camera is not None else scene.motion
 
 
 def plan_asset_durations(refs: tuple[AssetRef, ...], total: float) -> list[float]:
@@ -1200,7 +1231,8 @@ def render_asset_clip(info: MediaInfo, output: Path, *, frames: int, start: floa
 def ensure_asset_clip(project: Path, info: MediaInfo, *, frames: int, start: float, motion: str,
                       fit: str, settings: RenderSettings) -> tuple[Path, bool]:
     key = _key("aclip-v1", _sha256_file(info.path), info.kind, f"{start:.3f}", frames,
-               motion if info.kind == "image" else None, fit, settings.width, settings.height,
+               (motion.key() if isinstance(motion, scene_camera.Camera) else motion)
+               if info.kind == "image" else None, fit, settings.width, settings.height,
                settings.fps, ZOOM_ENGINE, ZOOM_OVERSAMPLE)
     folder = project / ".scene_cache" / "clips"
     final = folder / f"{key}.mp4"
@@ -1265,7 +1297,7 @@ def ensure_scene_visual(project: Path, manifest: SceneManifest, scene: Scene,
                 "when it starts at 0"
             )
         clip, created = ensure_asset_clip(
-            project, info, frames=count, start=ref.start, motion=ref.motion or scene.motion,
+            project, info, frames=count, start=ref.start, motion=effective_motion(ref, scene),
             fit=ref.fit or scene.fit, settings=settings,
         )
         clips.append(clip)
