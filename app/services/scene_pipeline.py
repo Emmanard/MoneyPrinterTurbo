@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
-from app.services import scene_camera, scene_look, scene_text
+from app.services import scene_camera, scene_look, scene_sfx, scene_text
 from app.services.video_project import (
     _ID,
     ProjectError,
@@ -78,7 +78,7 @@ USED_SCENE_FIELDS = frozenset({
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
 TEXT_SETTINGS = ("captions", "text_card_style")
-USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness", "look", "text_card_animation")
+USED_SETTINGS = RENDER_SETTINGS + TRIM_SETTINGS + TEXT_SETTINGS + ("loudness", "look", "text_card_animation", "sfx")
 
 # Final loudness normalisation (two-pass loudnorm), off unless settings.loudness is set.
 DEFAULT_TARGET_LUFS = -14.0
@@ -155,6 +155,7 @@ class Transition:
     type: str
     duration: float
     flash: dict | None = None
+    sfx: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,7 @@ class SceneManifest:
     loudness: Loudness | None = None
     look: dict | None = None
     text_card_animation: dict | None = None
+    sfx: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +308,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
     loudness = None
     look_default: dict = {}
     animation_default: dict = {}
+    sfx_settings: dict | None = None
     if not isinstance(settings_raw, dict):
         errors.append("settings: must be an object")
     else:
@@ -337,6 +340,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
         look_default = scene_look.parse_look(settings_raw.get("look"), "settings.look", errors)
         animation_default = scene_text.parse_animation(
             settings_raw.get("text_card_animation"), "settings.text_card_animation", errors)
+        sfx_settings = scene_sfx.parse_settings(settings_raw.get("sfx"), "settings.sfx", errors)
 
     voice_name = None
     voice_rate = 1.0
@@ -443,7 +447,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
             item.get("transition"), label, errors,
             settings.fps if settings is not None else DEFAULT_SETTINGS["fps"],
         )
-        if transition is not None and transition.type != "cut" and index == len(scenes_raw) - 1:
+        if transition is not None and (transition.type != "cut" or transition.sfx) and index == len(scenes_raw) - 1:
             errors.append(f"{label}.transition: the last scene has no next scene to transition to")
         if scene_text.merge_caption(caption_defaults, captions)["enabled"] and not narration.strip():
             errors.append(f"{label}.captions: captions need narration text; turn them off for this scene")
@@ -473,7 +477,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
         raise ManifestError("\n".join(dict.fromkeys(errors)))
     return SceneManifest(project_id, voice_name, voice_rate, settings, trim, tuple(scenes),
                          caption_defaults, card_defaults, bgm, loudness, look_default,
-                         animation_default or None)
+                         animation_default or None, sfx_settings or None)
 
 
 def _parse_assets(raw: object, label: str, folder: Path, errors: list[str]) -> tuple[AssetRef, ...]:
@@ -530,17 +534,18 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
         errors.append(f"{label}.transition: must be an object")
         return None
     for key in raw:
-        if key not in ("type", "duration", "flash"):
+        if key not in ("type", "duration", "flash", "sfx"):
             errors.append(f"{label}.transition: unknown field: {key}")
     kind = raw.get("type")
     if kind not in TRANSITION_TYPES:
         errors.append(f"{label}.transition.type: must be one of {', '.join(TRANSITION_TYPES)}")
         return None
     duration = raw.get("duration", DEFAULT_TRANSITION_SECONDS)
+    sfx = scene_sfx.parse_sfx(raw.get("sfx"), f"{label}.transition.sfx", errors)
     if kind == "cut":
         if "flash" in raw:
             errors.append(f"{label}.transition.flash: a cut has no overlap to flash over")
-        return Transition("cut", 0.0)
+        return Transition("cut", 0.0, None, sfx)
     if not _is_number(duration) or not MIN_TRANSITION_SECONDS <= duration <= MAX_TRANSITION_SECONDS:
         errors.append(
             f"{label}.transition.duration: must be a number from {MIN_TRANSITION_SECONDS:g} "
@@ -554,7 +559,7 @@ def _parse_transition(raw: object, label: str, errors: list[str], fps: int) -> T
         )
         return None
     flash = scene_look.parse_flash(raw.get("flash"), f"{label}.transition", float(duration), errors)
-    return Transition(kind, float(duration), flash)
+    return Transition(kind, float(duration), flash, sfx)
 
 
 def _parse_loudness(raw: object, errors: list[str]) -> Loudness | None:
@@ -1316,6 +1321,8 @@ def uses_post(manifest: SceneManifest) -> bool:
     for scene in manifest.scenes:
         if scene.look and scene_look.look_filters(scene.look):
             return True
+        if any(card.sfx for card in scene.text_cards) or (scene.transition is not None and scene.transition.sfx):
+            return True
         if scene.pause_after > 0 or scene.text_cards or scene.volume_db:
             return True
         if scene.transition is not None and scene.transition.type != "cut":
@@ -1453,6 +1460,8 @@ def build(project: Path, *, synthesize: Synthesizer | None = None,
             result["loudness"] = post["loudness"]
         if "music" in post:
             result["music"] = post["music"]
+        if "sfx" in post:
+            result["sfx"] = post["sfx"]
         return result
     exported = Path(status["export"]["path"])
     out_dir = project / "out"

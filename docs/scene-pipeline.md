@@ -88,6 +88,7 @@ to anything other than null is an error.
 | `text_card_style` | used | Default style for every text card |
 | `loudness` | used | `{target_lufs, true_peak_db}`: normalise the final audio; off unless set. Defaults -14 LUFS and -1.5 dBTP (target -50 to -5, peak -9 to 0) |
 | `text_card_animation` | used | Default `{in, out, duration, stagger}` for every text card (see Card animation). Off unless set |
+| `sfx` | used | `{enabled, volume}`: the master switch (default on) and the default volume (0.35) for sound effects (see Sound effects) |
 | `look` | used | Default look for every scene: `{vignette, grade}` (see Look). Off unless set |
 
 ### `bgm`
@@ -119,8 +120,8 @@ to anything other than null is an error.
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
 | `volume_db` | used | Gain for this scene's narration in dB, -30 to 12, default 0. Applied in the post stages, separately from `settings.narration_volume`; only that scene's narration segments (and its junctions) rebuild |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
-| `text_cards` | used | List of `{text, style, start, end, kind, label, value, source, animation}`, up to 20 (see Text card kinds and Card animation) |
-| `transition` | used | `{type, duration, flash}`; joins this scene to the next. `flash` is optional (see Look) |
+| `text_cards` | used | List of `{text, style, start, end, kind, label, value, source, animation, sfx}`, up to 20 (see Text card kinds and Card animation) |
+| `transition` | used | `{type, duration, flash, sfx}`; joins this scene to the next. `flash` (see Look) and `sfx` (see Sound effects) are optional |
 | `look` | used | `{vignette, grade}` for this scene; overrides `settings.look` field by field |
 
 `assets[]` entries: `file` (filename in `assets/`), `start` (seconds into a video
@@ -447,6 +448,33 @@ graphics. Narration still crossfades with equal power for every type.
 - Warnings are added to the build result when the output is more than 1 LU from the
   target or the true peak is more than 0.3 dB over the limit after the AAC encode.
 - Silent audio cannot be measured and fails the build with a clear message.
+
+### Sound effects
+
+Synthesised by the tool from ffmpeg sources (noise and sine expressions): no sample files, no
+downloads. Optional and off by default; a manifest without `sfx` renders exactly as before.
+
+```json
+"transition": {"type": "slide_left", "duration": 0.4, "sfx": {"type": "whoosh", "volume": 0.35, "offset": -0.1}}
+"text_cards": [{"text": "...", "start": 0.3, "end": 1.9, "sfx": {"type": "click", "volume": 0.3}}]
+"settings": {"sfx": {"enabled": true, "volume": 0.35}}
+```
+
+- `type`: `whoosh` (0.5 s of filtered pink noise with a fixed seed, so it is the same every time),
+  `click` (a 60 ms decaying 1.8 kHz burst) or `riser` (a 1.2 s rising chirp).
+- `volume`: 0 to 1, linear. Default `settings.sfx.volume`, itself 0.35. `offset`: seconds from the
+  event, -1 to 1 (default 0). A transition's event is the start of the transition (the moment the
+  next scene begins to appear; for a `cut`, the cut); a card's event is the card's `start`.
+- A transition on the last scene cannot carry a sound. `settings.sfx.enabled: false` mutes every
+  event without removing them from the manifest.
+- All events are rendered into one track as long as the video and mixed in after the music
+  ducking, so a whoosh is not ducked by the narration. Events must land inside the video (checked
+  once the length is known, before rendering, and by `plan`); at most 100 events. The build
+  result lists them under `sfx`, and `plan` prints them.
+- Changing a sound rebuilds only the sound track and the final mix; pictures and narration
+  segments are untouched. Loudness normalisation runs on the finished mix, effects included.
+- Sound quality is subjective: synthesised whooshes can sound thin. Keep the volume low and
+  listen to a preview first.
 
 ### Camera
 

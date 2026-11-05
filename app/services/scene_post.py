@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from app.services import scene_look, scene_text
+from app.services import scene_look, scene_sfx, scene_text
 from app.services.scene_pipeline import (
     PipelineError,
     SceneManifest,
@@ -195,6 +195,9 @@ def validate_timeline(manifest: SceneManifest, durations: list[float]) -> None:
             errors.append(
                 f"bgm: fade_in {bgm.fade_in:g}s plus fade_out {bgm.fade_out:g}s is longer than the "
                 f"video ({total:.2f}s)")
+    _, sfx_errors = scene_sfx.events_for(manifest.scenes, frames, transition_frames(manifest, frames)[1],
+                                         fps, manifest.sfx)
+    errors.extend(sfx_errors)
     for index, scene in enumerate(manifest.scenes):
         length = frames[index] / fps
         scene_text.check_card_times(scene.text_cards, length, f"scene {scene.id}", errors)
@@ -437,8 +440,29 @@ def bgm_graph(volume: float, ducking, fade_in: float = 0.0, fade_out: float = 0.
     return ";".join(parts)
 
 
+def sfx_stage(ctx: _Context, events: list, seconds: float) -> Path:
+    """One WAV, as long as the video, with every sound effect on the timeline."""
+    key = _key(*scene_sfx.sfx_key(events, seconds))
+
+    def build(work: Path, staged: Path) -> None:
+        (work / "graph.txt").write_text(scene_sfx.build_graph(events, seconds), encoding="utf-8")
+        _ffmpeg(["-filter_complex_script", "graph.txt", "-map", "[a]", "-t", f"{seconds:.6f}",
+                 "-c:a", "pcm_s16le", "-f", "wav", str(staged)], work, "sound effects")
+
+    return _ensure(ctx, "sfx", key, ".wav", "sfx", build)
+
+
+def with_sfx(graph: str, index: int) -> str:
+    """Add the sound-effects track (input ``index``) to a mix graph that ends in [a]. The
+    effects are mixed in after ducking, so they are not ducked."""
+    fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    graph = graph[: graph.rindex("[a]")] + "[m0]"
+    return (f"{graph};[{index}:a]{fmt}[s];[m0][s]amix=inputs=2:duration=first:dropout_transition=0,"
+            "volume=2,alimiter=limit=0.95:level=0[a]")
+
+
 def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, audio: Path,
-           audio_key: str, frames: int) -> Path:
+           audio_key: str, frames: int, sfx: Path | None = None) -> Path:
     bgm = manifest.bgm
     bgm_path = ctx.project / "audio" / bgm.file if bgm else None
     key = _key("final-v1", video_key, audio_key, frames, ctx.fps,
@@ -446,17 +470,27 @@ def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, 
                                          None if bgm.ducking is None else
                                          [bgm.ducking.amount, bgm.ducking.attack,
                                           bgm.ducking.release]]
-                                        + ([bgm.fade_in, bgm.fade_out] if bgm.fade_in or bgm.fade_out else []))
+                                        + ([bgm.fade_in, bgm.fade_out] if bgm.fade_in or bgm.fade_out else []),
+               *([["sfx", _sha256_file(sfx)]] if sfx is not None else []))
     seconds = frames / ctx.fps
 
     def build(work: Path, staged: Path) -> None:
         command = [*_input(video), *_input(audio)]
-        if bgm is None:
+        if bgm is None and sfx is None:
             command += ["-map", "0:v:0", "-map", "1:a:0"]
         else:
-            command += _input(bgm_path, "-stream_loop", "-1")
-            (work / "graph.txt").write_text(bgm_graph(bgm.volume, bgm.ducking, bgm.fade_in, bgm.fade_out, seconds),
-                                                   encoding="utf-8")
+            fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+            if bgm is None:
+                graph = f"[1:a]{fmt}[a]"
+                next_input = 2
+            else:
+                command += _input(bgm_path, "-stream_loop", "-1")
+                graph = bgm_graph(bgm.volume, bgm.ducking, bgm.fade_in, bgm.fade_out, seconds)
+                next_input = 3
+            if sfx is not None:
+                command += _input(sfx)
+                graph = with_sfx(graph, next_input)
+            (work / "graph.txt").write_text(graph, encoding="utf-8")
             command += ["-filter_complex_script", "graph.txt", "-map", "0:v:0", "-map", "[a]"]
         command += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{seconds:.6f}",
                     "-movflags", "+faststart", str(staged)]
@@ -707,7 +741,11 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
                                ["-an", "-movflags", "+faststart"])
     audio, audio_key = _concat(ctx, audio_segments, "audio", ".wav", "join:narration", [])
     count = total_frames(frames, tails)
-    final = _final(ctx, manifest, video, video_key, audio, audio_key, count)
+    events, sfx_problems = scene_sfx.events_for(manifest.scenes, frames, tails, settings.fps, manifest.sfx)
+    if sfx_problems:
+        raise PipelineError("\n".join(sfx_problems))
+    sfx_track = sfx_stage(ctx, events, count / settings.fps) if events else None
+    final = _final(ctx, manifest, video, video_key, audio, audio_key, count, sfx_track)
     report = None
     normalised = None
     if manifest.loudness is not None:
@@ -743,6 +781,8 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
         finally:
             part.unlink(missing_ok=True)
         result["music"] = {**record, "record": str(music_path)}
+    if events:
+        result["sfx"] = [{"type": e.kind, "time": round(e.time, 3), "volume": e.volume} for e in events]
     if report is not None:
         loud_media = out_dir / f"{name}.loudnorm.mp4"
         loud_report = out_dir / f"{name}.loudnorm.json"

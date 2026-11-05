@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.services import scene_sfx
+
 FONT_DIR = Path(__file__).resolve().parents[2] / "resource" / "fonts"
 FONT_EXTENSIONS = frozenset({".ttf", ".ttc", ".otf"})
 DEFAULT_CAPTION_FONT = "BeVietnamPro-Bold.ttf"
@@ -108,6 +110,7 @@ class TextCard:
     value: str = ""
     source: str = ""
     animation: dict | None = None
+    sfx: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -323,7 +326,7 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("text", "style", "start", "end", "kind", "label", "value", "source", "animation"):
+            if key not in ("text", "style", "start", "end", "kind", "label", "value", "source", "animation", "sfx"):
                 errors.append(f"{name}: unknown field: {key}")
         kind = item.get("kind", "plain")
         if kind not in CARD_KINDS:
@@ -371,8 +374,9 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
             errors.append(f"{name}.end: must be a number of seconds after start")
             end = float(start) + 1.0
         animation = parse_animation(item.get("animation"), f"{name}.animation", errors)
+        sfx = scene_sfx.parse_sfx(item.get("sfx"), f"{name}.sfx", errors)
         cards.append(TextCard(text, style, float(start), float(end), kind, label, value, source,
-                              animation or None))
+                              animation or None, sfx))
     return tuple(cards)
 
 

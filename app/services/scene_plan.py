@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 from app.services import scene_pipeline as sp
-from app.services import scene_look, scene_post, scene_text
+from app.services import scene_look, scene_post, scene_sfx, scene_text
 
 PENDING_NOTE = (
     "narration is not generated yet: length, per-asset durations, card windows and "
@@ -203,6 +203,11 @@ def build_plan(project: Path) -> dict:
 
     known = [f for f in frames if f is not None]
     all_known = len(known) == len(frames)
+    sfx_events: list = []
+    if all_known:
+        sfx_events, sfx_problems = scene_sfx.events_for(manifest.scenes, known, tails, fps, manifest.sfx)
+        if sfx_problems and entries:
+            entries[0]["problems"].extend(sfx_problems)
     bgm = manifest.bgm
     if bgm is not None and (bgm.fade_in or bgm.fade_out) and all_known and entries:
         seconds = (sum(known) - sum(tails)) / fps
@@ -218,6 +223,7 @@ def build_plan(project: Path) -> dict:
         "total_frames": sum(known) - sum(tails) if all_known else None,
         "total_seconds": _round((sum(known) - sum(tails)) / fps) if all_known else None,
         "transition_frames": sum(tails),
+        "sfx": [{"type": e.kind, "time": round(e.time, 3), "volume": e.volume} for e in sfx_events],
         "music_fades": None if bgm is None or not (bgm.fade_in or bgm.fade_out) else
         {"fade_in": bgm.fade_in, "fade_out": bgm.fade_out},
         "music": None if manifest.bgm is None or not manifest.bgm.folder else {
@@ -299,6 +305,8 @@ def format_text(plan: dict) -> str:
         for text in e["problems"]:
             lines.append(f"  PROBLEM: {text}")
     lines.append("")
+    for event in summary.get("sfx") or []:
+        lines.append(f"sfx: {event['type']} at {event['time']:.2f} s, volume {event['volume']:g}")
     if summary.get("music_fades"):
         fades = summary["music_fades"]
         lines.append(f"music fades: in {fades['fade_in']:g} s, out {fades['fade_out']:g} s")

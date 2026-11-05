@@ -2121,3 +2121,231 @@ def test_plan_describes_the_camera(project, capsys):
                             camera={"from": {"zoom": 1.0}, "to": {"zoom": 1.3, "x": 0.4}, "ease": "ease_out"})])
     assert sp.main(["--project", str(project), "plan", "--text"]) == 0
     assert "camera zoom 1->1.3, focus (0.5,0.5)->(0.4,0.5), ease_out" in capsys.readouterr().out
+
+
+# -- E6: synthesised sound effects ---------------------------------------------------------
+
+from app.services import scene_sfx  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,message", [
+    ("whoosh", "sfx: must be an object"),
+    ({"type": "boom"}, "sfx.type: must be one of whoosh, click, riser"),
+    ({}, "sfx.type: must be one of whoosh, click, riser"),
+    ({"type": "click", "volume": 1.5}, "sfx.volume: must be a number from 0 to 1"),
+    ({"type": "click", "offset": 2}, "sfx.offset: must be a number of seconds from -1 to 1"),
+    ({"type": "click", "pitch": 3}, "sfx: unknown field: pitch"),
+])
+def test_sfx_is_validated(raw, message):
+    errors = []
+    scene_sfx.parse_sfx(raw, "sfx", errors)
+    assert any(message in e for e in errors), errors
+
+
+@pytest.mark.parametrize("raw,message", [
+    ("loud", "settings.sfx: must be an object"),
+    ({"enabled": "yes"}, "settings.sfx.enabled: must be true or false"),
+    ({"volume": 2}, "settings.sfx.volume: must be a number from 0 to 1"),
+    ({"level": 1}, "settings.sfx: unknown field: level"),
+])
+def test_sfx_settings_are_validated(raw, message):
+    errors = []
+    scene_sfx.parse_settings(raw, "settings.sfx", errors)
+    assert any(message in e for e in errors), errors
+
+
+def test_sfx_is_off_by_default(project):
+    _write(project, [_scene("s1", transition={"type": "crossfade", "duration": 0.3}), _scene("s2", "two.wav", "b.png")])
+    manifest = sp.load_manifest(project)
+    assert manifest.sfx is None
+    result = _build(project)
+    assert "sfx" not in result and "sfx" not in result["post_stages"]
+    assert not (project / ".scene_cache" / "post" / "sfx").exists()
+
+
+def test_sfx_fields_parse_on_transitions_and_cards_and_use_the_post_stages(project):
+    _write(project, [_scene("s1", transition={"type": "cut", "sfx": {"type": "click"}}), _scene("s2", "two.wav", "b.png")])
+    manifest = sp.load_manifest(project)
+    assert manifest.scenes[0].transition.sfx == {"type": "click", "offset": 0.0}
+    assert sp.uses_post(manifest)
+    _write(project, [_scene("s1", text_cards=[{"text": "x", "start": 0.1, "end": 0.5, "sfx": {"type": "whoosh"}}])])
+    assert sp.load_manifest(project).scenes[0].text_cards[0].sfx == {"type": "whoosh", "offset": 0.0}
+
+
+def test_a_sound_on_the_last_scenes_transition_is_rejected(project):
+    _write(project, [_scene("s1"), _scene("s2", "two.wav", "b.png", transition={"type": "cut", "sfx": {"type": "click"}})])
+    assert "the last scene has no next scene" in _errors(project)
+
+
+def test_events_are_placed_on_the_final_timeline():
+    class T:  # a minimal stand-in for a Transition
+        def __init__(self, sfx): self.sfx = sfx
+
+    class C:
+        def __init__(self, start, sfx): self.start, self.sfx = start, sfx
+
+    class S:
+        def __init__(self, sid, transition=None, cards=()): self.id, self.transition, self.text_cards = sid, transition, cards
+
+    scenes = [S("a", T({"type": "whoosh", "offset": -0.1}), (C(0.5, {"type": "click"}),)),
+              S("b", None, (C(0.2, {"type": "click", "volume": 0.9}),)), S("c")]
+    # fps 10; scene a 20 frames with a 4-frame tail, b 15 frames, c 10 frames
+    events, errors = scene_sfx.events_for(scenes, [20, 15, 10], [4, 0, 0], 10, None)
+    assert errors == []
+    times = {(e.kind, round(e.time, 3), e.volume) for e in events}
+    # b starts at (20 - 4) / 10 = 1.6 s: whoosh at 1.6 - 0.1, card click at 0.5, and b's click at 1.6 + 0.2
+    assert times == {("whoosh", 1.5, 0.35), ("click", 0.5, 0.35), ("click", 1.8, 0.9)}
+    assert [e.time for e in events] == sorted(e.time for e in events)
+
+
+def test_events_outside_the_video_are_rejected_and_the_master_switch_drops_them():
+    class C:
+        def __init__(self, start): self.start, self.sfx = start, {"type": "click", "offset": 0.0}
+
+    class S:
+        id = "a"; transition = None; text_cards = (C(9.0),)
+
+    events, errors = scene_sfx.events_for([S()], [10], [0], 10, None)
+    assert errors and "outside the video" in errors[0]
+    assert scene_sfx.events_for([S()], [10], [0], 10, {"enabled": False}) == ([], [])
+    many = type("M", (), {"id": "m", "transition": None,
+                          "text_cards": tuple(C(0.0) for _ in range(101))})
+    _, errors = scene_sfx.events_for([many], [10], [0], 10, None)
+    assert any("limit is 100" in e for e in errors)
+
+
+def test_the_sfx_graph_places_and_pads_every_event():
+    graph = scene_sfx.build_graph([scene_sfx.Event("click", 0.5, 0.3), scene_sfx.Event("riser", 1.25, 0.2)], 3.0)
+    assert graph.startswith("anullsrc=r=48000:cl=stereo:d=3.000000[base]")
+    assert "adelay=500|500" in graph and "adelay=1250|1250" in graph
+    assert graph.count("apad=whole_dur=3.000000") == 2
+    assert "amix=inputs=3:duration=longest:dropout_transition=0,volume=3," in graph and graph.endswith("[a]")
+    assert "seed=7" in scene_sfx.sound_graph("whoosh")
+
+
+def test_every_sound_is_synthesised_with_the_right_length_and_is_not_silent(project):
+    for kind, seconds in scene_sfx.SOUND_SECONDS.items():
+        out = project / f"{kind}.wav"
+        _ff(["-filter_complex", scene_sfx.build_graph([scene_sfx.Event(kind, 0.0, 1.0)], seconds + 0.2),
+             "-map", "[a]", "-t", f"{seconds + 0.2:.3f}", str(out)])
+        assert _duration(out) == pytest.approx(seconds + 0.2, abs=0.03)
+        assert _window_level(out, 0, seconds) > -45
+
+
+def test_the_same_graph_gives_the_same_whoosh_every_time(project):
+    graph = scene_sfx.build_graph([scene_sfx.Event("whoosh", 0.0, 0.5)], 0.6)
+    first, second = project / "w1.wav", project / "w2.wav"
+    for path in (first, second):
+        _ff(["-filter_complex", graph, "-map", "[a]", "-t", "0.6", "-c:a", "pcm_s16le", str(path)])
+    assert first.read_bytes() == second.read_bytes()
+
+
+def _high_level(path, start, length):
+    return _level(path, start, length)
+
+
+def _click_project(project, **sfx):
+    card = {"text": "x", "start": 0.5, "end": 1.0, "sfx": {"type": "click", **sfx}}
+    return [_scene("s1", audio="three.wav", motion="static", text_cards=[card])]
+
+
+def test_a_card_sound_lands_at_the_card_start(project):
+    _write(project, _click_project(project, volume=0.8))
+    out = _build(project)["output"]
+    at = _level(out, 0.5, 0.05)
+    before = _level(out, 0.3, 0.05)
+    after = _level(out, 0.9, 0.05)
+    assert at > before + 15 and at > after + 15
+
+
+def test_an_offset_moves_the_sound(project):
+    _write(project, _click_project(project, volume=0.8, offset=0.3))
+    out = _build(project)["output"]
+    assert _level(out, 0.8, 0.05) > _level(out, 0.5, 0.05) + 15
+
+
+def test_doubling_the_volume_raises_the_level_by_about_six_db(project):
+    _write(project, _click_project(project, volume=0.2))
+    low = _level(_build(project)["output"], 0.5, 0.05)
+    _write(project, _click_project(project, volume=0.4))
+    high = _level(_build(project)["output"], 0.5, 0.05)
+    assert high - low == pytest.approx(6.0, abs=1.5)
+
+
+def test_a_transition_sound_lands_where_the_transition_starts(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.4, "sfx": {"type": "click", "volume": 0.8}}),
+              _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    result = _build(project)
+    start = (14 - 4) / 10  # scene 2 starts one transition before scene 1 ends
+    assert result["sfx"] == [{"type": "click", "time": start, "volume": 0.8}]
+    assert _level(result["output"], start, 0.05) > _level(result["output"], start - 0.3, 0.05) + 15
+
+
+def test_sfx_does_not_change_the_length_and_can_be_switched_off_for_the_whole_project(project):
+    scenes = _click_project(project)
+    _write(project, scenes)
+    plain_scenes = [dict(scenes[0], text_cards=[{**scenes[0]["text_cards"][0], "sfx": None}])]
+    with_sound = _build(project)
+    assert with_sound["frames"] == 13
+    kept = project / "with_sound.mp4"
+    shutil.copyfile(with_sound["output"], kept)
+    manifest = {"schema_version": 1, "project_id": "ep", "scenes": scenes,
+                "settings": {**SETTINGS, "sfx": {"enabled": False}}}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    muted = _build(project)
+    assert "sfx" not in muted and "sfx" not in muted["post_stages"]
+    assert muted["frames"] == 13
+    assert _level(muted["output"], 0.5, 0.05) < _level(kept, 0.5, 0.05) - 6
+
+
+def test_the_project_volume_is_the_default_for_every_event(project):
+    scenes = _click_project(project)
+    manifest = {"schema_version": 1, "project_id": "ep", "scenes": scenes,
+                "settings": {**SETTINGS, "sfx": {"volume": 0.6}}}
+    (project / "scenes.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert _build(project)["sfx"][0]["volume"] == 0.6
+
+
+def test_sfx_is_not_ducked_by_the_narration_and_works_with_music(project):
+    card = {"text": "x", "start": 0.5, "end": 1.0, "sfx": {"type": "click", "volume": 0.8}}
+    _write(project, [_scene("s1", audio="three.wav", motion="static", text_cards=[card])],
+           bgm={"file": "music_long.wav", "volume": 0.3, "ducking": {}})
+    out = _build(project)["output"]
+    assert _level(out, 0.5, 0.05) > _level(out, 0.3, 0.05) + 6
+
+
+def test_changing_a_sound_rebuilds_only_the_sfx_track_and_the_final_mix(project):
+    scenes = _click_project(project) + [_scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[0]["text_cards"][0]["sfx"]["volume"] = 0.9
+    _write(project, scenes)
+    assert _rebuilt(_build(project)) == {"sfx", "final"}
+
+
+def test_removing_the_sound_goes_back_to_the_original_mix(project):
+    scenes = _click_project(project)
+    _write(project, scenes)
+    first = _build(project)["post_stages"]
+    del scenes[0]["text_cards"][0]["sfx"]
+    _write(project, scenes)
+    assert "sfx" not in _build(project)["post_stages"] and "sfx" in first
+
+
+def test_plan_lists_the_sound_events_and_problems(project, capsys):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.3, "sfx": {"type": "whoosh"}}),
+              _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    assert "sfx: whoosh at 1.10 s, volume 0.35" in capsys.readouterr().out
+    _write(project, [dict(scenes[0], transition={"type": "crossfade", "duration": 0.3,
+                                                   "sfx": {"type": "click", "offset": 1.0}}),
+                     _scene("s2", "two.wav", "b.png")])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 1
+    assert "outside the video" in capsys.readouterr().out
+    _write(project, [dict(scenes[0], text_cards=[{"text": "x", "start": 0.1, "end": 0.4,
+                                                    "sfx": {"type": "click", "offset": -0.5}}]),
+                     _scene("s2", "two.wav", "b.png")])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 1
+    assert "outside the video" in capsys.readouterr().out

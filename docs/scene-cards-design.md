@@ -307,3 +307,13 @@ legacy path is untouched. Changes from the proposal: the clip key version stays 
 and old manifests must keep their keys; the x and y expressions use the zoom expression
 directly instead of the `zoompan` `zoom` variable, which lags one frame; `to` fields missing
 from the camera inherit `from`.
+
+**E6 sound effects (built):** `whoosh`, `click`, `riser`, on `transition.sfx` and
+`text_cards[].sfx`, with `settings.sfx {enabled, volume}`. Everything is synthesised by ffmpeg
+(`anoisesrc` with a fixed seed, `aevalsrc`); no sample files and no downloads. Code is in the new
+`app/services/scene_sfx.py`. Changes from the proposal: instead of per-segment parallel effect
+tracks joined by stream copy, one stage renders a single track as long as the video (silence plus
+every event delayed with `adelay`, each padded to full length so `amix` keeps a constant weight);
+it is mixed into the final mix after the ducking, so effects are not ducked. A change to a sound
+rebuilds that stage and the final mix. A `cut` may carry a sound; the proposal's separate
+`riser`/audition step is left to the preview project. The sounds are simple on purpose.
