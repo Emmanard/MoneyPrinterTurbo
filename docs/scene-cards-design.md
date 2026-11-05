@@ -243,4 +243,15 @@ Deviations from the sketch above, made to fit the existing flat style dictionary
 - Plain cards with the default alignment and no panel use the original code path, so their
   output and cache keys are unchanged.
 
-Next: D2 (fact card with a label, accent bar, quote card).
+**D2 (built):** fact card (optional label, value, optional caption), quote card (mark, quote,
+dim source) and the accent bar (`accent_width`, `accent_side`), all static. Notes:
+
+- Fact and quote cards default to a 10 px bar (top and left); claim and plain cards default
+  to none, so their output is unchanged (checked frame by frame against the D1 preview).
+- The bar is part of the panel and is only drawn when the panel is on.
+- A left bar on a centred card pads both sides, so the text stays centred in the panel.
+- The 48 px fact value floor scales with the frame (48 px at 1080).
+- The quote mark is drawn at 2.4 times the size and reserves 45% of its line height, since the
+  glyph sits at the top of its line box.
+
+Next: animation (fade, slide_up, pop, stagger). Not started.

@@ -114,7 +114,7 @@ to anything other than null is an error.
 | `fit` | used | `cover` (default) fills the frame and crops; `contain_blur` shows the whole picture over a blurred copy of itself |
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
-| `text_cards` | used | List of `{text, style, start, end, kind, label}`, up to 20 (see Text card kinds) |
+| `text_cards` | used | List of `{text, style, start, end, kind, label, value, source}`, up to 20 (see Text card kinds) |
 | `transition` | used | `{type, duration}`; joins this scene to the next |
 
 `assets[]` entries: `file` (filename in `assets/`), `start` (seconds into a video
@@ -139,6 +139,7 @@ Used by `captions.style`, `text_cards[].style`, `settings.captions.style` and
 | `align` | Text cards only. `center` (default) or `left`. Left text starts at the left safe margin (or at the panel's padding) |
 | `panel`, `panel_color`, `panel_opacity` | Text cards only. One rectangle behind the whole card instead of a box per line. Off for plain cards, on for claim cards; colour default `#000000`, opacity 0.72 |
 | `accent_color` | Text cards only. `#RRGGBB`, default `#FFD400`. The label colour of claim cards. Set it in `settings.text_card_style` for a project default; a card's own `style.accent_color` overrides it |
+| `accent_width`, `accent_side` | Text cards only. A solid bar in `accent_color` on the panel's `left` (default) or `top` edge, 0 to 40 px (default 0 = none; fact and quote cards default to 10). The bar needs the panel: it is only drawn when `panel` is on, so a project-wide `accent_width` never puts bars on plain cards |
 
 Defaults come from the code; a scene's style overrides the settings default,
 which overrides the code default.
@@ -263,7 +264,7 @@ Captions reject the card-only keys (`align`, `panel`, `panel_color`, `panel_opac
 
 ### Text card kinds
 
-`kind` is `plain` (default, the cards described above) or `claim`. A plain card renders
+`kind` is `plain` (default, the cards described above), `claim`, `quote` or `fact`. A plain card renders
 exactly as it did before the kinds existed, with the same cache keys, unless you set
 `align: "left"` or `panel: true` on it.
 
@@ -286,6 +287,36 @@ A **claim card** is a small label over a larger claim, left aligned, on one pane
 - Readability over photos: the default panel is 72% black, and the text keeps its dark
   outline. Lower `panel_opacity` only for plain backgrounds.
 - The card appears and disappears with a hard cut. `plan` lists the kind and label.
+
+A **fact card** is a small label over a big centred value, with an optional caption:
+
+```json
+{"kind": "fact", "label": "Last listed", "value": "Oct 26", "text": "Allenwood Low",
+ "start": 10.6, "end": 19.7}
+```
+
+- `value`: required, one line, 1 to 14 characters, drawn at 2.2 times the card size and never
+  shrunk below 48 px at 1080 wide (scaled with the frame); a value too wide for the frame at
+  that floor is rejected before rendering. `label`: optional, one line, up to 40 characters, small
+  capitals in `accent_color`. `text`: optional caption, up to 80 characters.
+- Defaults: centred, panel on, a 10 px accent bar on top.
+
+A **quote card** is an accent quotation mark, the quote and a dim source line:
+
+```json
+{"kind": "quote", "text": "We have no additional information to provide.",
+ "source": "Bureau of Prisons", "start": 4.8, "end": 9.5}
+```
+
+- `text`: required, up to 200 characters. `source`: optional, one line, up to 60 characters,
+  shown after an em dash at 65% size in grey. The opening mark is added for you.
+- Defaults: left aligned, panel on, a 10 px accent bar on the left. Set `accent_width: 0` for
+  no bar.
+
+Fields belong to their kind: `label` is for claim and fact cards, `value` for fact cards,
+`source` for quote cards; anywhere else they are rejected. All kinds use the safe margins and
+the panel keeps the text readable over photos. Plain and claim cards are not affected by the
+fact, quote and bar options: their output and cache keys are unchanged.
 
 ### Transitions and timing
 

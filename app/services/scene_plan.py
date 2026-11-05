@@ -95,8 +95,9 @@ def _card_rows(manifest: sp.SceneManifest, scene: sp.Scene, length: float | None
         styles.append(style)
         row = {"index": index, "kind": card.kind, "text": card.text, "position": style["position"],
                "start": card.start, "end": card.end}
-        if card.kind == "claim":
-            row["label"] = card.label
+        for field in ("label", "value", "source"):
+            if getattr(card, field):
+                row[field] = getattr(card, field)
         try:
             drawn = [i for i in scene_text.card_items(card, style, width, height)
                      if isinstance(i, scene_text.DrawLine)]
@@ -247,10 +248,16 @@ def format_text(plan: dict) -> str:
             detail = f"{c['position']}, {c.get('lines', '?')} line(s), size {c.get('size', '?')}"
             if c.get("shrunk_from"):
                 detail += f" (shrunk from {c['shrunk_from']})"
-            shown = c["text"].splitlines()[0][:48]
-            if c.get("kind") == "claim":
+            shown = c["text"].splitlines()[0][:48] if c["text"] else ""
+            kind = c.get("kind", "plain")
+            if kind == "claim":
                 shown = f"{c['label']}: {shown}"
-                detail += ", claim"
+            elif kind == "fact":
+                shown = " ".join(x for x in (c.get("label", ""), c["value"], shown) if x)
+            elif kind == "quote" and c.get("source"):
+                shown = f"{shown} -- {c['source']}"
+            if kind != "plain":
+                detail += f", {kind}"
             lines.append(f"  card {c['index']}: {window} [{detail}] {shown}")
         cap = e["captions"]
         if cap["enabled"]:

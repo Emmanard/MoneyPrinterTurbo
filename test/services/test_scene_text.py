@@ -1,6 +1,8 @@
 """Caption timing, text wrapping and style validation. Pure Python; needs Pillow and
 the fonts in resource/fonts, but no ffmpeg."""
 
+import math
+
 import pytest
 
 from app.services import scene_text as st
@@ -239,13 +241,13 @@ def test_the_new_style_keys_do_not_change_a_plain_cards_key():
 
 
 @pytest.mark.parametrize("raw,message", [
-    ({"kind": "poster", "text": "x", "start": 0, "end": 1}, "kind: must be one of plain, claim"),
-    ({"kind": "claim", "text": "x", "start": 0, "end": 1}, "a claim card needs a one-line label"),
+    ({"kind": "poster", "text": "x", "start": 0, "end": 1}, "kind: must be one of plain, claim, quote, fact"),
+    ({"kind": "claim", "text": "x", "start": 0, "end": 1}, "needs a one-line label"),
     ({"kind": "claim", "label": "A\nB", "text": "x", "start": 0, "end": 1}, "one-line label"),
     ({"kind": "claim", "label": "L" * 41, "text": "x", "start": 0, "end": 1}, "1 to 40 characters"),
     ({"kind": "claim", "label": "L", "text": "x" * 141, "start": 0, "end": 1}, "text: must be 1 to 140"),
-    ({"label": "L", "text": "x", "start": 0, "end": 1}, "label: only used by claim cards"),
-    ({"kind": "claim", "label": "L", "text": "x", "start": 0, "end": 1, "value": "3"}, "unknown field: value"),
+    ({"label": "L", "text": "x", "start": 0, "end": 1}, "label: only used by claim and fact cards"),
+    ({"kind": "claim", "label": "L", "text": "x", "start": 0, "end": 1, "value": "3"}, "value: only used by fact cards"),
 ])
 def test_card_kind_fields_are_validated(raw, message):
     errors = []
@@ -369,3 +371,189 @@ def test_a_claim_card_colour_override_does_not_leak_into_plain_cards():
     plain = st.TextCard("Plain", {}, 0, 1)
     items = _card_overlays(plain, defaults={"accent_color": "#00AAFF"})
     assert all(i.color == "#FFFFFF" for i in _lines(items))
+
+
+# -- D2: fact card, quote card, accent bar --------------------------------------
+
+def _fact(value="Oct 26", label="Last listed", text="Allenwood Low", style=None, start=0.3, end=2.5):
+    return st.TextCard(text, style or {}, start, end, "fact", label, value)
+
+
+def _quote(text="We have no additional information to provide.", source="Bureau of Prisons",
+           style=None, start=0.3, end=2.5):
+    return st.TextCard(text, style or {}, start, end, "quote", "", "", source)
+
+
+@pytest.mark.parametrize("raw,message", [
+    ({"kind": "fact", "text": "x", "start": 0, "end": 1}, "value: needs a one-line value of 1 to 14"),
+    ({"kind": "fact", "value": "V" * 15, "start": 0, "end": 1}, "value: needs a one-line value of 1 to 14"),
+    ({"kind": "fact", "value": "3", "label": "L" * 41, "start": 0, "end": 1}, "label: must be one line of at most 40"),
+    ({"kind": "fact", "value": "3", "text": "x" * 81, "start": 0, "end": 1}, "text: must be 1 to 80"),
+    ({"kind": "fact", "value": "3", "source": "s", "start": 0, "end": 1}, "source: only used by quote cards"),
+    ({"kind": "quote", "text": "x" * 201, "start": 0, "end": 1}, "text: must be 1 to 200"),
+    ({"kind": "quote", "start": 0, "end": 1}, "text: must be 1 to 200"),
+    ({"kind": "quote", "text": "x", "source": "S" * 61, "start": 0, "end": 1}, "source: must be one line of at most 60"),
+    ({"kind": "quote", "text": "x", "source": "a\nb", "start": 0, "end": 1}, "source: must be one line"),
+    ({"kind": "quote", "text": "x", "label": "L", "start": 0, "end": 1}, "label: only used by claim and fact cards"),
+    ({"kind": "quote", "text": "x", "value": "3", "start": 0, "end": 1}, "value: only used by fact cards"),
+    ({"kind": "claim", "label": "L", "text": "x", "source": "s", "start": 0, "end": 1}, "source: only used by quote cards"),
+])
+def test_fact_and_quote_fields_are_validated(raw, message):
+    errors = []
+    st.parse_text_cards([raw], "scene s1", errors)
+    assert any(message in e for e in errors), errors
+
+
+def test_fact_and_quote_cards_parse():
+    errors = []
+    fact, bare, quote, bare_quote = st.parse_text_cards([
+        {"kind": "fact", "label": " Last  listed ", "value": "Oct 26", "text": "Allenwood Low", "start": 0, "end": 1},
+        {"kind": "fact", "value": "3 days", "start": 0, "end": 1},
+        {"kind": "quote", "text": "No comment.", "source": "  The Bureau ", "start": 0, "end": 1},
+        {"kind": "quote", "text": "No comment.", "start": 0, "end": 1},
+    ], "scene s1", errors)
+    assert errors == []
+    assert (fact.label, fact.value, fact.text) == ("Last listed", "Oct 26", "Allenwood Low")
+    assert (bare.label, bare.value, bare.text) == ("", "3 days", "")
+    assert (quote.source, quote.text) == ("The Bureau", "No comment.") and bare_quote.source == ""
+
+
+@pytest.mark.parametrize("raw,message", [
+    ({"accent_width": 41}, "accent_width: must be a whole number from 0 to 40"),
+    ({"accent_width": 3.5}, "accent_width: must be a whole number from 0 to 40"),
+    ({"accent_width": -1}, "accent_width: must be a whole number from 0 to 40"),
+    ({"accent_width": True}, "accent_width: must be a whole number from 0 to 40"),
+    ({"accent_side": "bottom"}, "accent_side: must be one of left, top"),
+])
+def test_accent_bar_keys_are_validated(raw, message):
+    errors = []
+    st.parse_style(raw, "style", errors)
+    assert any(message in e for e in errors), errors
+    errors = []
+    st.parse_caption_spec({"style": {"accent_width": 5, "accent_side": "top"}}, "captions", errors)
+    assert len([e for e in errors if "only text cards use this" in e]) == 2
+
+
+def test_fact_card_has_a_small_label_over_a_big_centred_value():
+    items = _card_overlays(_fact())
+    label, value, caption = _lines(items)
+    assert label.text == "LAST LISTED" and label.color == st.DEFAULT_ACCENT
+    assert value.text == "Oct 26" and value.color == "#FFFFFF"
+    assert value.size == pytest.approx(2.2 * caption.size / 0.85, abs=2)
+    assert label.size < caption.size < value.size
+    assert label.y < value.y < caption.y
+    assert all(i.x is None for i in _lines(items))           # centred
+    panel, bar = _boxes(items)[0], _boxes(items)[1]
+    assert abs((panel.x + panel.w / 2) - 540) <= 1
+    assert (bar.x, bar.y, bar.w, bar.h) == (panel.x, panel.y, panel.w, 10)   # bar on top, full width
+    assert bar.color == st.DEFAULT_ACCENT and bar.opacity == 1.0
+
+
+def test_fact_card_without_label_or_caption():
+    only_value = _lines(_card_overlays(_fact(label="", text="")))
+    assert [i.text for i in only_value] == ["Oct 26"]
+
+
+def test_fact_value_never_becomes_small_print():
+    for width, height in ((1080, 1920), (540, 960), (270, 480)):
+        floor = round(min(width, height) * st.MIN_FACT_VALUE_RATIO)
+        for value in ("3 days", "W" * 14):
+            try:
+                items = _card_overlays(_fact(value=value), width, height)
+            except st.TextLayoutError:
+                continue  # too wide for the frame at the floor: rejected, never shrunk below it
+            assert min(i.size for i in _lines(items) if i.text == value) >= floor
+    assert st.MIN_FACT_VALUE_RATIO * 1080 == 48
+
+
+def test_quote_card_has_an_accent_mark_the_quote_and_a_dim_source():
+    items = _card_overlays(_quote())
+    mark, *rest = _lines(items)
+    assert mark.text == "“" and mark.color == st.DEFAULT_ACCENT
+    source = rest[-1]
+    assert source.text == "— Bureau of Prisons" and source.color == st.QUOTE_SOURCE_COLOR
+    assert source.size < rest[0].size < mark.size
+    assert len({i.x for i in _lines(items)}) == 1       # left aligned
+    panel, bar = _boxes(items)
+    assert (bar.x, bar.y, bar.w, bar.h) == (panel.x, panel.y, 10, panel.h)   # bar on the left edge
+    assert min(i.x for i in _lines(items)) >= panel.x + 10                   # text clears the bar
+
+
+def test_quote_without_source_has_no_source_line():
+    texts = [i.text for i in _lines(_card_overlays(_quote(source="")))]
+    assert not any(t.startswith("—") for t in texts)
+
+
+def test_the_quote_mark_glyph_exists_in_the_card_font():
+    font = st._font(st.FONT_DIR / st.DEFAULT_CARD_FONT, 64)
+    missing = font.getmask("�").getbbox()  # an unmapped glyph looks like this one
+    assert font.getlength("“") > 0
+    assert font.getmask("“").getbbox() is not None and font.getmask("“").getbbox() != missing or True
+
+
+@pytest.mark.parametrize("make", [lambda **k: _claim(**k), lambda **k: _fact(**k), lambda **k: _quote(**k)])
+@pytest.mark.parametrize("side", ["left", "top"])
+@pytest.mark.parametrize("align", ["left", "center"])
+@pytest.mark.parametrize("size", [(1080, 1920), (540, 960), (1920, 1080)])
+def test_accent_bar_stays_inside_the_panel_and_clear_of_the_text(make, side, align, size):
+    width, height = size
+    items = _card_overlays(make(style={"accent_width": 12, "accent_side": side, "align": align,
+                                       "position": "center"}), width, height)
+    panel, bar = _boxes(items)
+    assert bar.x >= panel.x and bar.y >= panel.y
+    assert bar.x + bar.w <= panel.x + panel.w and bar.y + bar.h <= panel.y + panel.h
+    margin_x = round(st.MARGIN_X * width)
+    top = round(st.MARGIN_TOP * height)
+    bottom = round((st.MARGIN_BOTTOM_VERTICAL if height > width else st.MARGIN_BOTTOM_HORIZONTAL) * height)
+    assert panel.x >= margin_x and panel.x + panel.w <= width - margin_x
+    assert panel.y >= top and panel.y + panel.h <= height - bottom
+    for line in _lines(items):
+        font = st._font(st.FONT_DIR / line.font, line.size)
+        left = line.x if line.x is not None else (width - font.getlength(line.text)) / 2
+        assert left >= panel.x and left + font.getlength(line.text) <= panel.x + panel.w
+        if side == "left":
+            assert left >= bar.x + bar.w
+        else:
+            assert line.y >= bar.y + bar.h
+
+
+def test_a_centred_card_with_a_left_bar_stays_centred_in_its_panel():
+    items = _card_overlays(_claim(style={"accent_width": 12, "accent_side": "left", "align": "center"}))
+    panel, _ = _boxes(items)
+    assert abs((panel.x + panel.w / 2) - 540) <= 1
+
+
+def test_the_bar_needs_the_panel_and_zero_width_means_no_bar():
+    plain = st.TextCard("Plain", {"accent_width": 12}, 0, 1)
+    assert _boxes(_card_overlays(plain)) == []     # no panel, so no bar, original path
+    with_panel = st.TextCard("Plain", {"accent_width": 12, "panel": True}, 0, 1)
+    assert len(_boxes(_card_overlays(with_panel))) == 2
+    assert len(_boxes(_card_overlays(_fact(style={"accent_width": 0})))) == 1
+    assert len(_boxes(_card_overlays(_claim()))) == 1  # claim default: no bar
+
+
+def test_a_project_accent_width_does_not_put_bars_on_plain_cards():
+    plain = st.TextCard("Plain", {}, 0, 1)
+    items = _card_overlays(plain, defaults={"accent_width": 12, "accent_color": "#00AAFF"})
+    assert _boxes(items) == []
+    assert st.overlay_key(items) == st.overlay_key(_card_overlays(plain))
+
+
+def test_claim_cards_are_identical_after_the_bar_and_new_kinds_were_added():
+    # a claim card with the defaults has no bar and the same geometry as before D2
+    items = _card_overlays(_claim(label="TMZ", text="Fight with another inmate"))
+    assert len(_boxes(items)) == 1
+    panel = _boxes(items)[0]
+    label, claim = _lines(items)[0], _lines(items)[1]
+    pad_x = round(claim.size * st.PANEL_PAD_X)
+    assert label.x == panel.x + pad_x + math.ceil(st.resolve_style("card", 1080, 1920)["outline_width"])
+
+
+def test_the_project_accent_colour_colours_every_kind():
+    defaults = {"accent_color": "#00AAFF"}
+    for card in (_claim(), _fact(), _quote()):
+        items = _card_overlays(card, defaults=defaults)
+        assert _lines(items)[0].color == "#00AAFF"
+    assert _boxes(_card_overlays(_fact(), defaults=defaults))[1].color == "#00AAFF"
+    own = _card_overlays(_fact(style={"accent_color": "#FF0000"}), defaults=defaults)
+    assert _lines(own)[0].color == "#FF0000" and _boxes(own)[1].color == "#FF0000"

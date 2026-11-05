@@ -24,19 +24,43 @@ MODE_WORDS = {"chunks": 3, "words": 1, "lines": 7}
 STYLE_KEYS = frozenset({
     "font", "size", "color", "outline_color", "outline_width", "position",
     "box", "box_color", "box_opacity",
-    "align", "panel", "panel_color", "panel_opacity", "accent_color",
+    "align", "panel", "panel_color", "panel_opacity", "accent_color", "accent_width", "accent_side",
 })
 # Keys that only text cards use; captions reject them.
-CARD_ONLY_KEYS = frozenset({"align", "panel", "panel_color", "panel_opacity", "accent_color"})
+CARD_ONLY_KEYS = frozenset({
+    "align", "panel", "panel_color", "panel_opacity", "accent_color", "accent_width", "accent_side",
+})
 ALIGNS = ("center", "left")
-CARD_KINDS = ("plain", "claim")
-MAX_CLAIM_LABEL = 40
+ACCENT_SIDES = ("left", "top")
+MAX_ACCENT_WIDTH = 40
+CARD_KINDS = ("plain", "claim", "quote", "fact")
+# Fields each kind accepts besides style, start and end. "text" is the main text.
+KIND_FIELDS = {
+    "plain": ("text",),
+    "claim": ("text", "label"),
+    "quote": ("text", "source"),
+    "fact": ("text", "label", "value"),
+}
+MAX_LABEL = 40
 MAX_CLAIM_TEXT = 140
+MAX_QUOTE_TEXT = 200
+MAX_QUOTE_SOURCE = 60
+MAX_FACT_VALUE = 14
+MAX_FACT_TEXT = 80
+MIN_FACT_VALUE_RATIO = 48 / 1080  # the value never shrinks below 48 px at 1080 (scaled with the frame)
+QUOTE_SOURCE_COLOR = "#D0D0D0"
+QUOTE_MARK_SCALE = 2.4   # the opening mark is drawn this many times the base size
+QUOTE_MARK_HEIGHT = 0.45  # and reserves this share of its line height (the glyph sits at the top)
+DEFAULT_ACCENT_WIDTH = 10
 DEFAULT_ACCENT = "#FFD400"
 # Defaults a card kind applies on top of settings.text_card_style (a card's own style wins).
 KIND_DEFAULTS = {
     "plain": {},
     "claim": {"align": "left", "panel": True, "box": False},
+    "quote": {"align": "left", "panel": True, "box": False, "accent_width": DEFAULT_ACCENT_WIDTH,
+              "accent_side": "left"},
+    "fact": {"align": "center", "panel": True, "box": False, "accent_width": DEFAULT_ACCENT_WIDTH,
+             "accent_side": "top"},
 }
 
 MAX_CUES_PER_SCENE = 400
@@ -73,6 +97,8 @@ class TextCard:
     end: float
     kind: str = "plain"
     label: str = ""
+    value: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +211,16 @@ def parse_style(raw: object, label: str, errors: list[str], card: bool = True) -
                 errors.append(f"{label}.align: must be one of {', '.join(ALIGNS)}")
             else:
                 style[key] = value
+        elif key == "accent_side":
+            if value not in ACCENT_SIDES:
+                errors.append(f"{label}.accent_side: must be one of {', '.join(ACCENT_SIDES)}")
+            else:
+                style[key] = value
+        elif key == "accent_width":
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_ACCENT_WIDTH:
+                errors.append(f"{label}.accent_width: must be a whole number from 0 to {MAX_ACCENT_WIDTH}")
+            else:
+                style[key] = value
         elif key in ("box_opacity", "panel_opacity"):
             if not _is_number(value) or not 0 <= value <= 1:
                 errors.append(f"{label}.{key}: must be a number from 0 to 1")
@@ -232,26 +268,45 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
             errors.append(f"{name}: must be an object")
             continue
         for key in item:
-            if key not in ("text", "style", "start", "end", "kind", "label"):
+            if key not in ("text", "style", "start", "end", "kind", "label", "value", "source"):
                 errors.append(f"{name}: unknown field: {key}")
         kind = item.get("kind", "plain")
         if kind not in CARD_KINDS:
             errors.append(f"{name}.kind: must be one of {', '.join(CARD_KINDS)}")
             kind = "plain"
-        limit = MAX_CLAIM_TEXT if kind == "claim" else MAX_CARD_TEXT
-        text = item.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > limit:
+        for field in ("label", "value", "source"):
+            if field in item and field not in KIND_FIELDS[kind]:
+                owners = " and ".join(k for k in CARD_KINDS if field in KIND_FIELDS[k])
+                errors.append(f"{name}.{field}: only used by {owners} cards")
+
+        def one_line(field: str, limit: int, required: bool) -> str:
+            value = item.get(field, "")
+            ok = isinstance(value, str) and "\n" not in value and len(value) <= limit
+            if ok and required and not value.strip():
+                ok = False
+            if not ok:
+                errors.append(
+                    f"{name}.{field}: needs a one-line {field} of 1 to {limit} characters" if required
+                    else f"{name}.{field}: must be one line of at most {limit} characters")
+                return ""
+            return " ".join(value.split())
+
+        label = value = source = ""
+        text = item.get("text", "")
+        if kind == "claim":
+            label = one_line("label", MAX_LABEL, True)
+        elif kind == "fact":
+            label = one_line("label", MAX_LABEL, False) if "label" in item else ""
+            value = one_line("value", MAX_FACT_VALUE, True)
+        elif kind == "quote":
+            source = one_line("source", MAX_QUOTE_SOURCE, False) if "source" in item else ""
+        limit = {"claim": MAX_CLAIM_TEXT, "quote": MAX_QUOTE_TEXT, "fact": MAX_FACT_TEXT}.get(kind, MAX_CARD_TEXT)
+        text_optional = kind == "fact"
+        if text_optional and ("text" not in item or item.get("text") == ""):
+            text = ""
+        elif not isinstance(text, str) or not text.strip() or len(text) > limit:
             errors.append(f"{name}.text: must be 1 to {limit} characters")
             text = ""
-        label = item.get("label", "")
-        if kind == "claim":
-            if not isinstance(label, str) or not label.strip() or len(label) > MAX_CLAIM_LABEL or "\n" in label:
-                errors.append(f"{name}.label: a claim card needs a one-line label of 1 to {MAX_CLAIM_LABEL} characters")
-                label = ""
-            label = " ".join(label.split())
-        elif "label" in item:
-            errors.append(f"{name}.label: only used by claim cards")
-            label = ""
         style = parse_style(item.get("style"), f"{name}.style", errors)
         start, end = item.get("start"), item.get("end")
         if not _is_number(start) or start < 0:
@@ -260,7 +315,7 @@ def parse_text_cards(raw: object, label: str, errors: list[str]) -> tuple[TextCa
         if not _is_number(end) or end <= start:
             errors.append(f"{name}.end: must be a number of seconds after start")
             end = float(start) + 1.0
-        cards.append(TextCard(text, style, float(start), float(end), kind, label))
+        cards.append(TextCard(text, style, float(start), float(end), kind, label, value, source))
     return tuple(cards)
 
 
@@ -306,6 +361,8 @@ def resolve_style(kind: str, width: int, height: int, *layers: dict) -> dict:
         "panel_color": "#000000",
         "panel_opacity": 0.72,
         "accent_color": DEFAULT_ACCENT,
+        "accent_width": 0,
+        "accent_side": "left",
     }
     for layer in layers:
         style.update(layer or {})
@@ -475,6 +532,8 @@ class Part:
     scale: float = 1.0
     color: str | None = None
     single_line: bool = False
+    min_size: int = 0  # the block shrinks until this part fits, but never below this size
+    height_ratio: float = 1.0  # share of the line height the part reserves (a hanging quote mark uses less)
 
 
 @dataclass(frozen=True)
@@ -482,6 +541,7 @@ class Block:
     lines: list  # (text, size, color, y) in drawing order
     x: int | None  # left edge of the text, None = centred
     panel: tuple | None  # (x, y, w, h) or None
+    bar: tuple | None = None  # (x, y, w, h) of the accent bar, inside the panel, or None
 
 
 PANEL_PAD_X = 0.5   # panel padding, as a fraction of the base size
@@ -503,14 +563,23 @@ def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Blo
     outline = math.ceil(style["outline_width"])
     panel = style["panel"]
     left = style["align"] == "left"
+    bar_width = style["accent_width"] if panel else 0
+    bar_side = style["accent_side"]
     base = style["size"]
     while True:
         if panel:
             pad_x, pad_y = round(base * PANEL_PAD_X), round(base * PANEL_PAD_Y)
+            # The bar takes room of its own, so it never covers text: on the left it is
+            # added to the left padding (and to the right one when text is centred, to keep
+            # it centred); on top it is added to the top padding.
+            extra_left = bar_width if bar_side == "left" else 0
+            extra_top = bar_width if bar_side == "top" else 0
         else:
             pad_x = max(4, round(base * 0.25)) if style["box"] and left else 0
             pad_y = 0
-        max_width = width - 2 * margin_x - 2 * pad_x - 2 * outline
+            extra_left = extra_top = 0
+        pad_right = pad_x + (0 if left else extra_left)
+        max_width = width - 2 * margin_x - pad_x - extra_left - pad_right - 2 * outline
         gap = round(base * PART_GAP)
         rows = []  # (text, size, color, line_height, spacing)
         widest = 0.0
@@ -519,18 +588,18 @@ def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Blo
             size = max(MIN_FONT_SIZE, round(base * part.scale))
             font = _font(path, size)
             wrapped = wrap_lines(part.text, font, max_width)
-            if not wrapped or (part.single_line and len(wrapped) != 1):
+            if size < part.min_size or not wrapped or (part.single_line and len(wrapped) != 1):
                 fits = False
                 break
             ascent, descent = font.getmetrics()
             for text in wrapped:
                 widest = max(widest, font.getlength(text))
-            rows.append((wrapped, size, part.color or style["color"], ascent + descent,
-                         round(size * 0.1)))
+            rows.append((wrapped, size, part.color or style["color"],
+                         round((ascent + descent) * part.height_ratio), round(size * 0.1)))
         if fits:
             block = sum(len(w) * h + max(0, len(w) - 1) * s for w, _, _, h, s in rows)
             block += gap * (len(rows) - 1)
-            total = block + 2 * pad_y
+            total = block + 2 * pad_y + extra_top
             if total <= height - top - bottom:
                 break
         if base <= MIN_FONT_SIZE:
@@ -545,10 +614,11 @@ def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Blo
         y0 = max(top, min((height - total) // 2, height - bottom - total))
     else:
         y0 = height - bottom - total
-    panel_width = min(width - 2 * margin_x, math.ceil(widest) + 2 * outline + 2 * pad_x)
+    panel_width = min(width - 2 * margin_x,
+                      math.ceil(widest) + 2 * outline + pad_x + extra_left + pad_right)
     panel_x = margin_x if left else (width - panel_width) // 2
     lines = []
-    y = y0 + pad_y
+    y = y0 + pad_y + extra_top
     for index, (wrapped, size, color, height_of_line, spacing) in enumerate(rows):
         if index:
             y += gap
@@ -556,8 +626,35 @@ def layout_parts(parts: list[Part], style: dict, width: int, height: int) -> Blo
             lines.append((text, size, color, y))
             y += height_of_line + spacing
         y -= spacing
-    x = panel_x + pad_x + outline if left else None
-    return Block(lines, x, (panel_x, y0, panel_width, total) if panel else None)
+    x = panel_x + pad_x + extra_left + outline if left else None
+    bar = None
+    if bar_width:
+        bar = ((panel_x, y0, bar_width, total) if bar_side == "left"
+               else (panel_x, y0, panel_width, bar_width))
+    return Block(lines, x, (panel_x, y0, panel_width, total) if panel else None, bar)
+
+
+def card_parts(card: TextCard, style: dict, width: int = 1080, height: int = 1920) -> list[Part]:
+    """The parts of a card, top to bottom."""
+    accent = style["accent_color"]
+    if card.kind == "plain":
+        return [Part(card.text)]
+    if card.kind == "claim":
+        return [Part(card.label.upper(), 0.55, accent, single_line=True), Part(card.text)]
+    if card.kind == "quote":
+        parts = [Part("\u201c", QUOTE_MARK_SCALE, accent, single_line=True, height_ratio=QUOTE_MARK_HEIGHT),
+                 Part(card.text)]
+        if card.source:
+            parts.append(Part("\u2014 " + card.source, 0.65, QUOTE_SOURCE_COLOR))
+        return parts
+    parts = []  # fact: small label, big value, optional caption
+    if card.label:
+        parts.append(Part(card.label.upper(), 0.5, accent, single_line=True))
+    parts.append(Part(card.value, 2.2, None, single_line=True,
+                      min_size=round(min(width, height) * MIN_FACT_VALUE_RATIO)))
+    if card.text:
+        parts.append(Part(card.text, 0.85))
+    return parts
 
 
 def card_items(card: TextCard, style: dict, width: int, height: int) -> list:
@@ -566,17 +663,15 @@ def card_items(card: TextCard, style: dict, width: int, height: int) -> list:
     if plain and style["align"] == "center" and not style["panel"]:
         # The original path, untouched: same lines, same keys, same output.
         return _draw_lines(card.text, style, card.start, card.end, width, height)
-    if plain:
-        parts = [Part(card.text)]
-    else:
-        accent = style["accent_color"]
-        parts = [Part(card.label.upper(), 0.55, accent, single_line=True), Part(card.text)]
-    block = layout_parts(parts, style, width, height)
+    block = layout_parts(card_parts(card, style, width, height), style, width, height)
     items: list = []
     if block.panel is not None:
         px, py, pw, ph = block.panel
         items.append(DrawBox(px, py, pw, ph, style["panel_color"], style["panel_opacity"],
                              card.start, card.end))
+    if block.bar is not None:
+        bx, by, bw, bh = block.bar
+        items.append(DrawBox(bx, by, bw, bh, style["accent_color"], 1.0, card.start, card.end))
     for text, size, color, y in block.lines:
         items.append(DrawLine(text, style["font"], size, color, style["outline_color"],
                               style["outline_width"], y, style["box"], style["box_color"],

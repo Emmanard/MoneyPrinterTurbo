@@ -1351,3 +1351,94 @@ def test_settings_accent_color_is_the_project_default(project):
     assert loaded.text_card_style == {"accent_color": "#00AAFF"}
     label = next(i for i in _card_items(loaded) if isinstance(i, scene_post.scene_text.DrawLine))
     assert label.color == "#00AAFF"
+
+
+# -- D2: fact card, quote card and accent bar in real frames -----------------------
+
+def _card_scene(card):
+    card = {"start": 0.2, "end": 1.0, **card}
+    card["style"] = {"position": "center", **card.get("style", {})}
+    return _scene("s1", audio="three.wav", motion="static", text_cards=[card])
+
+
+def _boxes_of(project):
+    return [i for i in _card_items(sp.load_manifest(project)) if isinstance(i, scene_post.scene_text.DrawBox)]
+
+
+def _share(image, box, near, tolerance=40):
+    crop = image.convert("RGB").crop(box)
+    pixels = list(crop.getdata())
+    hits = [p for p in pixels if all(abs(p[i] - near[i]) <= tolerance for i in range(3))]
+    return len(hits) / len(pixels)
+
+
+FACT = {"kind": "fact", "label": "Last listed", "value": "Oct 26", "text": "Allenwood Low"}
+QUOTE = {"kind": "quote", "text": "No additional information.", "source": "Bureau of Prisons"}
+
+
+@pytest.mark.parametrize("card,side", [(FACT, "top"), (QUOTE, "left")])
+def test_accent_bar_is_a_solid_strip_of_the_accent_colour(project, card, side):
+    _write(project, [_card_scene({**card, "style": {"accent_color": "#FF2020"}})])
+    panel, bar = _boxes_of(project)
+    out = _build(project)["output"]
+    inside = Image.open(_frame(out, 0.6, project / "in.png"))
+    strip = (bar.x + 1, bar.y + 1, bar.x + bar.w - 1, bar.y + bar.h - 1)
+    assert _share(inside, strip, (255, 32, 32)) > 0.9
+    outside = Image.open(_frame(out, 1.2, project / "out.png"))
+    assert _share(outside, strip, (255, 32, 32)) < 0.1
+    assert bar.h == 10 if side == "top" else bar.w == 10
+
+
+@pytest.mark.parametrize("card", [FACT, QUOTE])
+def test_fact_and_quote_cards_darken_their_panel_and_keep_the_margins(project, card):
+    _write(project, [_card_scene(card)])
+    panel = _boxes_of(project)[0]
+    out = _build(project)["output"]
+    inside = Image.open(_frame(out, 0.6, project / "in.png"))
+    outside = Image.open(_frame(out, 1.2, project / "out.png"))
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+    assert _luma(inside, box) < 0.6 * _luma(outside, box)
+    margin = round(scene_post.scene_text.MARGIN_X * 270)
+    left, right = inside.convert("L"), outside.convert("L")
+    for strip in ((0, 0, margin - 1, 480), (270 - margin + 1, 0, 270, 480)):
+        diff = sum(abs(a - b) for a, b in zip(left.crop(strip).getdata(), right.crop(strip).getdata()))
+        assert diff / ((strip[2] - strip[0]) * 480) < 3
+
+
+def test_fact_value_is_drawn_in_white_and_the_label_in_the_accent(project):
+    _write(project, [_card_scene({**FACT, "style": {"accent_color": "#FF2020"}})])
+    panel = _boxes_of(project)[0]
+    inside = Image.open(_frame(_build(project)["output"], 0.6, project / "in.png"))
+    box = (panel.x, panel.y, panel.x + panel.w, panel.y + panel.h)
+    assert _share(inside, box, (255, 32, 32), 50) > 0.01      # label (and bar)
+    assert _share(inside, box, (255, 255, 255), 30) > 0.02    # value and caption
+
+
+def test_plan_describes_fact_and_quote_cards(project, capsys):
+    _write(project, [_scene("s1", audio="three.wav", motion="static", text_cards=[
+        {**FACT, "start": 0.1, "end": 0.6}, {**QUOTE, "start": 0.7, "end": 1.2}])])
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    text = capsys.readouterr().out
+    assert "Last listed Oct 26 Allenwood Low" in text and "No additional information. -- Bureau of Prisons" in text
+    assert sp.main(["--project", str(project), "plan"]) == 0
+    fact, quote = json.loads(capsys.readouterr().out)[0]["cards"]
+    assert fact["kind"] == "fact" and fact["value"] == "Oct 26" and fact["align"] == "center"
+    assert quote["kind"] == "quote" and quote["source"] == "Bureau of Prisons" and quote["align"] == "left"
+
+
+def test_cards_past_the_scene_end_are_still_rejected_for_every_kind(project):
+    for card in (FACT, QUOTE):
+        _write(project, [_card_scene({**card, "end": 30})])
+        with pytest.raises(sp.PipelineError, match="text_cards"):
+            _build(project)
+    assert not (project / "render").exists()
+
+
+def test_a_card_with_a_bar_rebuilds_only_its_scene(project):
+    scenes = [_card_scene({**QUOTE}), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[0]["text_cards"][0]["style"]["accent_width"] = 20
+    _write(project, scenes)
+    rebuilt = _rebuilt(_build(project))
+    assert "s1:picture" in rebuilt and "s2:picture" not in rebuilt
