@@ -267,3 +267,12 @@ available (plus `cut`). No new stages; the junction key already contains the xfa
 checks every mapped name against `ffmpeg -h filter=xfade` and that no ffmpeg transition is
 missing; the existing parametrised test builds all 46 and checks length and sync.
 `docs/scene-effects-proposal.md` is included in this stage as the design record.
+
+**E2 audio polish (built):** `bgm.fade_in` / `bgm.fade_out` (0 to 10 s) and `scenes[].volume_db`
+(-30 to 12 dB). Loudness normalisation was already built (stage B) and is unchanged.
+Changes from the proposal: the proposal split the final mux into `mix`, `measure` and
+`loudness` stages; that is no longer needed because loudness already runs after the final mux,
+so the fades go on the music stem inside the existing final mix and the gain goes into the
+existing narration segments. Per-scene gain and fades enter cache keys only when set, so old
+manifests keep their keys. `plan` shows fades and gains, and reports fades longer than the
+video.

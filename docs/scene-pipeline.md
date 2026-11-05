@@ -96,6 +96,7 @@ to anything other than null is an error.
 | `folder` | used | Plain name of a folder inside `audio/`; one file is picked from it (see Music) |
 | `seed` | used | Whole number from 0; chooses the file from `folder`. Default: a stable hash of `project_id`, so each project picks differently. Not allowed with `file` |
 | `volume` | used | Above 0, up to 1; default 0.25 |
+| `fade_in`, `fade_out` | used | Seconds, 0 to 10, default 0 (no fade). The music fades in from silence at the start and fades out so it is silent at the last frame. Their sum must not exceed the video length (checked once the length is known, before rendering) |
 | `ducking` | used | Omit for constant volume. `{}` turns ducking on with defaults |
 | `ducking.amount` | used | dB the music is lowered while narration plays, 0 to 18, default 12 |
 | `ducking.attack` | used | Milliseconds to duck once narration starts, 1 to 2000, default 150 |
@@ -113,6 +114,7 @@ to anything other than null is an error.
 | `motion` | used | `zoom_in` (default), `zoom_out`, `pan_left`, `pan_right`, `pan_up`, `pan_down`, `static`; images only |
 | `fit` | used | `cover` (default) fills the frame and crops; `contain_blur` shows the whole picture over a blurred copy of itself |
 | `pause_after` | used | Seconds of silence after the narration, 0 to 30 |
+| `volume_db` | used | Gain for this scene's narration in dB, -30 to 12, default 0. Applied in the post stages, separately from `settings.narration_volume`; only that scene's narration segments (and its junctions) rebuild |
 | `captions` | used | `{enabled, mode, style}`; overrides `settings.captions` field by field |
 | `text_cards` | used | List of `{text, style, start, end, kind, label, value, source}`, up to 20 (see Text card kinds) |
 | `transition` | used | `{type, duration}`; joins this scene to the next |
@@ -386,6 +388,11 @@ graphics. Narration still crossfades with equal power for every type.
   narration at about -20 dBFS (typical for generated speech); louder narration
   ducks a little more. `attack` and `release` set how fast it ducks and recovers.
 - The mix is limited at -0.45 dBFS to avoid clipping.
+- `fade_in` and `fade_out` shape the music stem before ducking (`afade`, linear). A manifest
+  without fades produces exactly the earlier mix; changing a fade rebuilds only the final mix.
+- `scenes[].volume_db` raises or lowers one scene's narration (for example a quiet take or a
+  loud one). A scene with a transition applies its gain on its own side of the narration
+  crossfade. Loudness normalisation (`settings.loudness`) still runs on the finished mix.
 
 ### Loudness
 

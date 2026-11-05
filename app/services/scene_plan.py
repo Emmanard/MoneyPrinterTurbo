@@ -152,7 +152,7 @@ def build_plan(project: Path) -> dict:
             except sp.PipelineError as exc:
                 entry["problems"].append(str(exc))
         entry.update(audio_seconds=_round(raw), trimmed_seconds=_round(trimmed),
-                     pause_after=scene.pause_after)
+                     pause_after=scene.pause_after, volume_db=scene.volume_db)
         trimmed_lengths.append(trimmed)
         entries.append(entry)
 
@@ -191,6 +191,13 @@ def build_plan(project: Path) -> dict:
 
     known = [f for f in frames if f is not None]
     all_known = len(known) == len(frames)
+    bgm = manifest.bgm
+    if bgm is not None and (bgm.fade_in or bgm.fade_out) and all_known and entries:
+        seconds = (sum(known) - sum(tails)) / fps
+        if bgm.fade_in + bgm.fade_out > seconds + 1e-6:
+            entries[0]["problems"].append(
+                f"bgm: fade_in {bgm.fade_in:g}s plus fade_out {bgm.fade_out:g}s is longer than the "
+                f"video ({seconds:.2f}s)")
     summary = {
         "project_id": manifest.project_id,
         "settings": f"{manifest.settings.width}x{manifest.settings.height} @ {fps} fps",
@@ -199,14 +206,14 @@ def build_plan(project: Path) -> dict:
         "total_frames": sum(known) - sum(tails) if all_known else None,
         "total_seconds": _round((sum(known) - sum(tails)) / fps) if all_known else None,
         "transition_frames": sum(tails),
+        "music_fades": None if bgm is None or not (bgm.fade_in or bgm.fade_out) else
+        {"fade_in": bgm.fade_in, "fade_out": bgm.fade_out},
         "music": None if manifest.bgm is None or not manifest.bgm.folder else {
             "folder": manifest.bgm.folder, "seed": manifest.bgm.seed,
             "seed_source": "manifest" if manifest.bgm.seed_explicit else "project_id",
             "candidates": manifest.bgm.candidates, "chosen": manifest.bgm.chosen},
         "loudness": None if manifest.loudness is None else (
             f"{manifest.loudness.target_lufs:g} LUFS, true peak {manifest.loudness.true_peak_db:g} dBTP"),
-        "loudness": None if manifest.loudness is None else
-        f"{manifest.loudness.target_lufs:g} LUFS, true peak {manifest.loudness.true_peak_db:g} dBTP",
         "problems": sum(len(e["problems"]) for e in entries),
         "warnings": sum(len(e["warnings"]) for e in entries),
     }
@@ -259,6 +266,8 @@ def format_text(plan: dict) -> str:
             if kind != "plain":
                 detail += f", {kind}"
             lines.append(f"  card {c['index']}: {window} [{detail}] {shown}")
+        if e.get("volume_db"):
+            lines.append(f"  narration gain: {e['volume_db']:+g} dB")
         cap = e["captions"]
         if cap["enabled"]:
             cues = "pending" if cap["cues"] is None else cap["cues"]
@@ -270,6 +279,9 @@ def format_text(plan: dict) -> str:
         for text in e["problems"]:
             lines.append(f"  PROBLEM: {text}")
     lines.append("")
+    if summary.get("music_fades"):
+        fades = summary["music_fades"]
+        lines.append(f"music fades: in {fades['fade_in']:g} s, out {fades['fade_out']:g} s")
     if summary["music"]:
         music = summary["music"]
         lines.append(f"music: {music['chosen']} picked from audio/{music['folder']}/ with seed "

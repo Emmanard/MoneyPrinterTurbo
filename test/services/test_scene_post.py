@@ -1475,3 +1475,116 @@ def test_an_unknown_transition_type_lists_the_valid_names(project):
     _write(project, [_scene("s1", transition={"type": "spin", "duration": 0.3}), _scene("s2", "two.wav", asset="b.png")])
     message = _errors(project)
     assert "transition.type: must be one of cut, crossfade" in message and "fade_slow" in message
+
+
+# -- E2: music fades and per-scene volume --------------------------------------------
+
+def _window_level(path, start, length):
+    done = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-ss", str(start), "-t", str(length), "-i", str(path),
+         "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True)
+    return float(re.search(r"mean_volume: (-?[\d.]+) dB", done.stderr).group(1))
+
+
+@pytest.mark.parametrize("raw,message", [
+    ({"fade_in": -1}, "bgm.fade_in: must be a number of seconds from 0 to 10"),
+    ({"fade_out": 11}, "bgm.fade_out: must be a number of seconds from 0 to 10"),
+    ({"fade_in": "slow"}, "bgm.fade_in: must be a number of seconds from 0 to 10"),
+])
+def test_music_fades_are_validated(project, raw, message):
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", **raw})
+    assert message in _errors(project)
+
+
+@pytest.mark.parametrize("value", [-31, 13, "loud", True])
+def test_scene_volume_db_is_validated(project, value):
+    _write(project, [_scene("s1", volume_db=value)])
+    assert "volume_db: must be a number of dB from -30 to 12" in _errors(project)
+
+
+def test_fades_and_gain_are_off_by_default(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "volume": 0.3, "ducking": {}})
+    manifest = sp.load_manifest(project)
+    assert manifest.bgm.fade_in == 0 and manifest.bgm.fade_out == 0
+    assert manifest.scenes[0].volume_db == 0
+    graph = scene_post.bgm_graph(0.3, manifest.bgm.ducking)
+    assert "afade" not in graph and scene_post.music_fades(0, 0, 5.0) == ""
+    assert scene_post._gain(0) == ""
+    assert sp.uses_post(sp.load_manifest(project))  # bgm alone already uses the post stages
+
+
+def test_music_fade_filters():
+    assert scene_post.music_fades(1.0, 1.5, 10.0) == ",afade=t=in:st=0:d=1.000,afade=t=out:st=8.500:d=1.500"
+    assert scene_post.music_fades(0, 2.0, 1.0) == ",afade=t=out:st=0.000:d=2.000"
+    graph = scene_post.bgm_graph(0.3, None, 1.0, 0.5, 4.0)
+    assert "volume=0.3000,afade=t=in" in graph and graph.index("afade") < graph.index("amix")
+
+
+def test_music_fades_shape_the_start_and_the_end(project):
+    scenes = [_scene("s1"), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.5})
+    plain = _build(project)["output"]
+    plain_start, plain_end = _window_level(plain, 0, 0.25), _window_level(plain, 2.0, 0.25)
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.5, "fade_in": 1.0, "fade_out": 1.0})
+    faded = _build(project)["output"]
+    assert _window_level(faded, 0, 0.25) < plain_start - 6
+    assert _window_level(faded, 2.0, 0.25) < plain_end - 6
+    mid = _window_level(faded, 1.0, 0.2)
+    assert mid > _window_level(faded, 0, 0.25) + 3
+
+
+def test_fades_longer_than_the_video_are_rejected_before_rendering(project):
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "fade_in": 1.0, "fade_out": 1.0})
+    with pytest.raises(sp.PipelineError, match="longer than the video"):
+        _build(project)
+    assert not (project / "render").exists()
+
+
+def test_changing_a_fade_rebuilds_only_the_final_mix(project):
+    scenes = [_scene("s1"), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3, "fade_out": 0.5})
+    _build(project)
+    _write(project, scenes, bgm={"file": "music_long.wav", "volume": 0.3, "fade_out": 0.8})
+    assert _rebuilt(_build(project)) == {"final"}
+
+
+def test_scene_volume_changes_that_scenes_narration_level(project):
+    scenes = [_scene("s1"), _scene("s2", "two.wav", "b.png")]
+    _write(project, scenes)
+    base = _build(project)["output"]
+    quiet = _window_level(base, 0.2, 0.5)
+    other = _window_level(base, 1.6, 0.3)
+    scenes[0]["volume_db"] = -12
+    _write(project, scenes)
+    result = _build(project)
+    assert _window_level(result["output"], 0.2, 0.5) == pytest.approx(quiet - 12, abs=1.0)
+    assert _window_level(result["output"], 1.6, 0.3) == pytest.approx(other, abs=1.0)
+
+
+def test_scene_volume_rebuilds_only_that_scene_and_its_junction(project):
+    scenes = [_scene("s1", transition={"type": "crossfade", "duration": 0.3}),
+              _scene("s2", "two.wav", "b.png"), _scene("s3", "three.wav", "a.png")]
+    _write(project, scenes)
+    _build(project)
+    scenes[2]["volume_db"] = 6
+    _write(project, scenes)
+    rebuilt = _rebuilt(_build(project))
+    assert "s3:narration" in rebuilt and "s1:narration" not in rebuilt and "s1>s2:narration" not in rebuilt
+    assert not any(label.endswith("picture") for label in rebuilt)
+
+
+def test_scene_volume_alone_uses_the_post_stages_and_zero_does_not(project):
+    _write(project, [_scene("s1", volume_db=3)])
+    assert sp.uses_post(sp.load_manifest(project))
+    _write(project, [_scene("s1", volume_db=0)])
+    assert not sp.uses_post(sp.load_manifest(project))
+
+
+def test_plan_shows_fades_and_gain(project, capsys):
+    _write(project, [_scene("s1", volume_db=-3)], bgm={"file": "music_long.wav", "fade_in": 0.3, "fade_out": 0.4})
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 0
+    text = capsys.readouterr().out
+    assert "music fades: in 0.3 s, out 0.4 s" in text and "narration gain: -3 dB" in text
+    _write(project, [_scene("s1")], bgm={"file": "music_long.wav", "fade_in": 1.0, "fade_out": 1.0})
+    assert sp.main(["--project", str(project), "plan", "--text"]) == 1
+    assert "longer than the video" in capsys.readouterr().out

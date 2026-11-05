@@ -111,6 +111,7 @@ class _Scene:
     audio_sha: str
     lines: list
     lines_key: list
+    volume_db: float = 0.0
 
 
 @dataclass
@@ -175,6 +176,10 @@ def _overlays(manifest: SceneManifest, scene, duration: float) -> list:
     )
 
 
+def _tails_of(manifest: SceneManifest, frames: list[int]) -> list[int]:
+    return transition_frames(manifest, frames)[1]
+
+
 def validate_timeline(manifest: SceneManifest, durations: list[float]) -> None:
     """Check everything that depends on real durations. Raises with all problems."""
     errors: list[str] = []
@@ -182,6 +187,13 @@ def validate_timeline(manifest: SceneManifest, durations: list[float]) -> None:
     _, _, problems = transition_frames(manifest, frames)
     errors.extend(problems)
     fps = manifest.settings.fps
+    bgm = manifest.bgm
+    if bgm is not None and (bgm.fade_in or bgm.fade_out):
+        total = total_frames(frames, _tails_of(manifest, frames)) / manifest.settings.fps
+        if bgm.fade_in + bgm.fade_out > total + 1e-6:
+            errors.append(
+                f"bgm: fade_in {bgm.fade_in:g}s plus fade_out {bgm.fade_out:g}s is longer than the "
+                f"video ({total:.2f}s)")
     for index, scene in enumerate(manifest.scenes):
         length = frames[index] / fps
         scene_text.check_card_times(scene.text_cards, length, f"scene {scene.id}", errors)
@@ -304,18 +316,26 @@ def _video_junction(ctx: _Context, first: _Scene, second: _Scene, kind: str) -> 
 
 # -- narration ------------------------------------------------------------
 
+def _gain(db: float) -> str:
+    """A volume filter for a per-scene gain in dB, or nothing at 0 dB (so unchanged scenes
+    keep their original filter strings and cache keys)."""
+    return f"volume={10 ** (db / 20):.6f}," if db else ""
+
+
+
 def _audio_body(ctx: _Context, scene: _Scene) -> Path | None:
     length = scene.frames - scene.head - scene.tail
     if length <= 0:
         return None
     start = _samples(scene.head, ctx.fps)
     end = _samples(scene.frames - scene.tail, ctx.fps)
-    key = _key(SEGMENT_VERSION, "abody", scene.audio_sha, scene.frames, start, end)
+    key = _key(SEGMENT_VERSION, "abody", scene.audio_sha, scene.frames, start, end,
+               *([scene.volume_db] if scene.volume_db else []))
 
     def build(work: Path, staged: Path) -> None:
         chain = (
-            f"apad=pad_dur={scene.pad_seconds:.3f},atrim=start_sample={start}:end_sample={end},"
-            "asetpts=PTS-STARTPTS"
+            f"{_gain(scene.volume_db)}apad=pad_dur={scene.pad_seconds:.3f},"
+            f"atrim=start_sample={start}:end_sample={end},asetpts=PTS-STARTPTS"
         )
         _ffmpeg(
             [*_input(scene.audio), "-af", chain, "-c:a", "pcm_s16le", "-f", "wav", str(staged)],
@@ -330,13 +350,14 @@ def _audio_junction(ctx: _Context, first: _Scene, second: _Scene) -> Path:
     first_start = _samples(first.frames - first.tail, ctx.fps)
     first_end = _samples(first.frames, ctx.fps)
     key = _key(SEGMENT_VERSION, "ajunction", first.audio_sha, first.frames, second.audio_sha,
-               second.frames, shared, first_start, first_end)
+               second.frames, shared, first_start, first_end,
+               *([first.volume_db, second.volume_db] if first.volume_db or second.volume_db else []))
 
     def build(work: Path, staged: Path) -> None:
         graph = (
-            f"[0:a]apad=pad_dur={first.pad_seconds:.3f},"
+            f"[0:a]{_gain(first.volume_db)}apad=pad_dur={first.pad_seconds:.3f},"
             f"atrim=start_sample={first_start}:end_sample={first_end},asetpts=PTS-STARTPTS[x];"
-            f"[1:a]apad=pad_dur={second.pad_seconds:.3f},"
+            f"[1:a]{_gain(second.volume_db)}apad=pad_dur={second.pad_seconds:.3f},"
             f"atrim=start_sample=0:end_sample={shared},asetpts=PTS-STARTPTS[y];"
             f"[x][y]acrossfade=d={(shared - 4) / SAMPLE_RATE:.6f}:c1=qsin:c2=qsin[z];"
             f"[z]atrim=end_sample={shared},asetpts=PTS-STARTPTS[a]"
@@ -374,9 +395,22 @@ def duck_ratio(amount: float) -> float:
     return min(20.0, 1.0 / (1.0 - min(amount, 19.0) / 20.0))
 
 
-def bgm_graph(volume: float, ducking) -> str:
+def music_fades(fade_in: float, fade_out: float, seconds: float) -> str:
+    """Filters that fade the music in at the start and out so it ends at ``seconds``; empty
+    when both fades are 0 (the music then runs at full level to the last frame, as before)."""
+    parts = []
+    if fade_in > 0:
+        parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        parts.append(f"afade=t=out:st={max(0.0, seconds - fade_out):.3f}:d={fade_out:.3f}")
+    return "".join("," + p for p in parts)
+
+
+def bgm_graph(volume: float, ducking, fade_in: float = 0.0, fade_out: float = 0.0,
+              seconds: float = 0.0) -> str:
     fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
-    parts = [f"[1:a]{fmt}[n]", f"[2:a]{fmt},volume={volume:.4f}[m]"]
+    fades = music_fades(fade_in, fade_out, seconds)
+    parts = [f"[1:a]{fmt}[n]", f"[2:a]{fmt},volume={volume:.4f}{fades}[m]"]
     if ducking is None:
         parts.append("[n][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,"
                      "alimiter=limit=0.95:level=0[a]")
@@ -400,7 +434,8 @@ def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, 
                None if bgm is None else [bgm.file, _sha256_file(bgm_path), bgm.volume,
                                          None if bgm.ducking is None else
                                          [bgm.ducking.amount, bgm.ducking.attack,
-                                          bgm.ducking.release]])
+                                          bgm.ducking.release]]
+                                        + ([bgm.fade_in, bgm.fade_out] if bgm.fade_in or bgm.fade_out else []))
     seconds = frames / ctx.fps
 
     def build(work: Path, staged: Path) -> None:
@@ -409,7 +444,8 @@ def _final(ctx: _Context, manifest: SceneManifest, video: Path, video_key: str, 
             command += ["-map", "0:v:0", "-map", "1:a:0"]
         else:
             command += _input(bgm_path, "-stream_loop", "-1")
-            (work / "graph.txt").write_text(bgm_graph(bgm.volume, bgm.ducking), encoding="utf-8")
+            (work / "graph.txt").write_text(bgm_graph(bgm.volume, bgm.ducking, bgm.fade_in, bgm.fade_out, seconds),
+                                                   encoding="utf-8")
             command += ["-filter_complex_script", "graph.txt", "-map", "0:v:0", "-map", "[a]"]
         command += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{seconds:.6f}",
                     "-movflags", "+faststart", str(staged)]
@@ -638,6 +674,7 @@ def assemble(project: Path, manifest: SceneManifest, durations: list[float], sta
             video_sha=status["stages"][f"{scene.id}:scene"]["sha256"],
             audio_sha=status["stages"][f"{scene.id}:audio"]["sha256"],
             lines=lines, lines_key=scene_text.overlay_key(lines),
+            volume_db=scene.volume_db,
         ))
 
     video_segments: list[Path] = []

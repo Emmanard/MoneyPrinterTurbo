@@ -73,7 +73,7 @@ RESERVED_SCENE_FIELDS: tuple[str, ...] = ()
 USED_TOP_LEVEL = frozenset({"schema_version", "project_id", "voice", "settings", "bgm", "scenes"})
 USED_SCENE_FIELDS = frozenset({
     "id", "narration", "asset", "assets", "audio", "motion", "fit", "pause_after",
-    "captions", "text_cards", "transition",
+    "captions", "text_cards", "transition", "volume_db",
 })
 RENDER_SETTINGS = ("width", "height", "fps", "narration_volume")
 TRIM_SETTINGS = ("trim_silence", "trim_padding")
@@ -112,6 +112,9 @@ MIN_TRANSITION_FRAMES = 2
 
 # Background music.
 DEFAULT_BGM_VOLUME = 0.25
+MAX_BGM_FADE = 10.0
+MIN_VOLUME_DB = -30.0
+MAX_VOLUME_DB = 12.0
 DEFAULT_DUCK_AMOUNT = 12.0
 MAX_DUCK_AMOUNT = 18.0
 DEFAULT_DUCK_ATTACK_MS = 150.0
@@ -176,6 +179,8 @@ class Bgm:
     seed: int | None = None
     candidates: int | None = None
     seed_explicit: bool = True
+    fade_in: float = 0.0
+    fade_out: float = 0.0
 
     @property
     def chosen(self) -> str:
@@ -195,6 +200,7 @@ class Scene:
     captions: dict | None = None
     text_cards: tuple = ()
     transition: Transition | None = None
+    volume_db: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -407,6 +413,11 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
         if not _is_number(pause_after) or not 0 <= pause_after <= MAX_PAUSE_AFTER:
             errors.append(f"{label}.pause_after: must be a number from 0 to {MAX_PAUSE_AFTER:g} seconds")
             pause_after = 0
+        volume_db = item.get("volume_db", 0)
+        if not _is_number(volume_db) or not MIN_VOLUME_DB <= volume_db <= MAX_VOLUME_DB:
+            errors.append(
+                f"{label}.volume_db: must be a number of dB from {MIN_VOLUME_DB:g} to {MAX_VOLUME_DB:g}")
+            volume_db = 0
         captions = scene_text.parse_caption_spec(item.get("captions"), f"{label}.captions", errors)
         cards = scene_text.parse_text_cards(item.get("text_cards"), label, errors)
         transition = _parse_transition(
@@ -427,6 +438,7 @@ def parse_manifest(raw: object, project: Path) -> SceneManifest:
                 fit=fit if isinstance(fit, str) else "cover",
                 assets=assets,
                 pause_after=float(pause_after),
+                volume_db=float(volume_db),
                 captions=captions,
                 text_cards=cards,
                 transition=transition,
@@ -606,7 +618,7 @@ def _parse_bgm(raw: object, folder: Path, errors: list[str], project_id: str = "
         errors.append("bgm: must be an object like {file or folder, seed, volume, ducking}")
         return None
     for key in raw:
-        if key not in ("file", "folder", "seed", "volume", "ducking"):
+        if key not in ("file", "folder", "seed", "volume", "ducking", "fade_in", "fade_out"):
             errors.append(f"bgm: unknown field: {key}")
     file = raw.get("file")
     pick: dict = {}
@@ -627,6 +639,13 @@ def _parse_bgm(raw: object, folder: Path, errors: list[str], project_id: str = "
     if not _is_number(volume) or not 0 < volume <= 1:
         errors.append("bgm.volume: must be a number above 0 and at most 1")
         volume = DEFAULT_BGM_VOLUME
+    fades = {}
+    for fade_key in ("fade_in", "fade_out"):
+        fade = raw.get(fade_key, 0)
+        if not _is_number(fade) or not 0 <= fade <= MAX_BGM_FADE:
+            errors.append(f"bgm.{fade_key}: must be a number of seconds from 0 to {MAX_BGM_FADE:g}")
+            fade = 0
+        fades[fade_key] = float(fade)
     ducking = None
     ducking_raw = raw.get("ducking")
     if ducking_raw is not None:
@@ -649,7 +668,7 @@ def _parse_bgm(raw: object, folder: Path, errors: list[str], project_id: str = "
                 errors.append("bgm.ducking.release: must be a number of milliseconds from 10 to 9000")
                 release = DEFAULT_DUCK_RELEASE_MS
             ducking = Ducking(float(amount), float(attack), float(release))
-    return Bgm(file if isinstance(file, str) else "", float(volume), ducking, **pick)
+    return Bgm(file if isinstance(file, str) else "", float(volume), ducking, **pick, **fades)
 
 
 def load_manifest(project: Path) -> SceneManifest:
@@ -1248,7 +1267,7 @@ def uses_post(manifest: SceneManifest) -> bool:
     if manifest.bgm is not None or manifest.loudness is not None:
         return True
     for scene in manifest.scenes:
-        if scene.pause_after > 0 or scene.text_cards:
+        if scene.pause_after > 0 or scene.text_cards or scene.volume_db:
             return True
         if scene.transition is not None and scene.transition.type != "cut":
             return True
