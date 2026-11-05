@@ -90,8 +90,19 @@ MAX_SCENE_ASSETS = 50
 ASSET_SUM_TOLERANCE = 0.25
 MIN_OPEN_ASSET_SECONDS = 0.1
 MAX_PAUSE_AFTER = 30.0
-TRANSITION_TYPES = ("cut", "crossfade", "fade_black", "fade_white", "dissolve",
-                    "wipe_left", "wipe_right", "slide_left", "slide_right")
+TRANSITION_TYPES = (
+    "cut", "crossfade", "fade_black", "fade_white", "dissolve",
+    "wipe_left", "wipe_right", "slide_left", "slide_right",
+    # the other 38 ffmpeg xfade transitions
+    "wipe_up", "wipe_down", "wipe_tl", "wipe_tr", "wipe_bl", "wipe_br",
+    "slide_up", "slide_down",
+    "smooth_left", "smooth_right", "smooth_up", "smooth_down",
+    "circle_crop", "rect_crop", "circle_open", "circle_close", "radial", "distance",
+    "vert_open", "vert_close", "horz_open", "horz_close",
+    "diag_tl", "diag_tr", "diag_bl", "diag_br",
+    "hl_slice", "hr_slice", "vu_slice", "vd_slice",
+    "pixelize", "hblur", "fade_grays", "squeeze_h", "squeeze_v", "zoom_in", "fade_fast", "fade_slow",
+)
 DEFAULT_TRANSITION_SECONDS = 0.5
 MIN_TRANSITION_SECONDS = 0.1
 MAX_TRANSITION_SECONDS = 3.0

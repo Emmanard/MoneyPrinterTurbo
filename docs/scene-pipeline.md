@@ -345,10 +345,24 @@ The rule, in frames at the project frame rate:
    a warning for such a transition. Add `pause_after` at least as long as the
    transition to make the overlap fall in silence.
 
-Types: `cut` (the default, no overlap), `crossfade`, `fade_black`, `fade_white`,
-`dissolve`, `wipe_left`, `wipe_right`, `slide_left`, `slide_right`. Duration is
-0.1 to 3 s (default 0.5) and at least 2 frames at the project frame rate (see
-rule 2).
+Types: all 46 of ffmpeg's `xfade` transitions plus `cut` (the default, no overlap).
+Duration is 0.1 to 3 s (default 0.5) and at least 2 frames at the project frame rate (see
+rule 2). A short default set that works on text-heavy graphics: `cut`, `crossfade`,
+`fade_black`, `slide_left`, `slide_right`, `wipe_left`, `wipe_right`.
+
+| Group | Names |
+|---|---|
+| Fades | `crossfade`, `fade_black`, `fade_white`, `dissolve`, `fade_grays`, `fade_fast`, `fade_slow` |
+| Wipes | `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `wipe_tl`, `wipe_tr`, `wipe_bl`, `wipe_br` |
+| Slides | `slide_left`, `slide_right`, `slide_up`, `slide_down`, `smooth_left`, `smooth_right`, `smooth_up`, `smooth_down` |
+| Shapes | `circle_crop`, `rect_crop`, `circle_open`, `circle_close`, `radial`, `distance` |
+| Doors | `vert_open`, `vert_close`, `horz_open`, `horz_close` |
+| Diagonals | `diag_tl`, `diag_tr`, `diag_bl`, `diag_br` |
+| Slices | `hl_slice`, `hr_slice`, `vu_slice`, `vd_slice` |
+| Other | `pixelize`, `hblur`, `squeeze_h`, `squeeze_v`, `zoom_in` |
+
+Some types (`distance`, `radial`, `pixelize`, `squeeze_h`) look wrong on text-heavy
+graphics. Narration still crossfades with equal power for every type.
 
 ### Music
 

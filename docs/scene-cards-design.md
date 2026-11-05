@@ -255,3 +255,15 @@ dim source) and the accent bar (`accent_width`, `accent_side`), all static. Note
   glyph sits at the top of its line box.
 
 Next: animation (fade, slide_up, pop, stagger). Not started.
+
+## 12. Workflow upgrade log (E1 to E6)
+
+Built in one run on top of D2, nothing committed. Each stage is saved as its own patch from
+the previous stage (`scene-projects/patches/E<n>.patch`), applied in order on HEAD. Every
+stage keeps manifests that do not use its features byte-identical in output and cache keys.
+
+**E1 transitions (built):** the 38 remaining ffmpeg xfade transitions, so all 46 are
+available (plus `cut`). No new stages; the junction key already contains the xfade name. A test
+checks every mapped name against `ffmpeg -h filter=xfade` and that no ffmpeg transition is
+missing; the existing parametrised test builds all 46 and checks length and sync.
+`docs/scene-effects-proposal.md` is included in this stage as the design record.

@@ -1442,3 +1442,36 @@ def test_a_card_with_a_bar_rebuilds_only_its_scene(project):
     _write(project, scenes)
     rebuilt = _rebuilt(_build(project))
     assert "s1:picture" in rebuilt and "s2:picture" not in rebuilt
+
+
+# -- E1: all xfade transitions --------------------------------------------------
+
+def _ffmpeg_xfade_names():
+    done = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=xfade"], capture_output=True, text=True)
+    return set(re.findall(r"^\s+(\w+)\s+\d+\s", done.stdout, re.M))
+
+
+def test_every_transition_maps_to_a_real_xfade_name():
+    if not shutil.which("ffmpeg"):
+        pytest.skip("native FFmpeg required")
+    real = _ffmpeg_xfade_names()
+    assert len(real) >= 46
+    mapped = {k: v for k, v in scene_post.TRANSITION_TYPES.items() if v is not None}
+    assert [k for k, v in mapped.items() if v not in real] == []
+    assert set(scene_post.TRANSITION_TYPES) == set(sp.TRANSITION_TYPES)
+    assert len(mapped) == 46 and len(set(mapped.values())) == 46
+    assert real - set(mapped.values()) - {"custom"} == set()  # every ffmpeg transition is available
+
+
+def test_the_nine_original_transitions_keep_their_xfade_names():
+    original = {"crossfade": "fade", "fade_black": "fadeblack", "fade_white": "fadewhite",
+                "dissolve": "dissolve", "wipe_left": "wipeleft", "wipe_right": "wiperight",
+                "slide_left": "slideleft", "slide_right": "slideright"}
+    assert {k: scene_post.TRANSITION_TYPES[k] for k in original} == original
+    assert scene_post.TRANSITION_TYPES["cut"] is None
+
+
+def test_an_unknown_transition_type_lists_the_valid_names(project):
+    _write(project, [_scene("s1", transition={"type": "spin", "duration": 0.3}), _scene("s2", "two.wav", asset="b.png")])
+    message = _errors(project)
+    assert "transition.type: must be one of cut, crossfade" in message and "fade_slow" in message
